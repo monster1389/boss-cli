@@ -2,7 +2,9 @@ param(
   [string]$RepoUrl = "https://github.com/monster1389/boss-cli",
   [string]$RepoRef = "codex-resume-sync",
   [string]$NodeVersion = "22.21.0",
-  [string]$Root = "$HOME\.boss-cli"
+  [string]$Root = "$HOME\.boss-cli",
+  [string]$WindowsNpmBinDir = "$env:APPDATA\npm",
+  [switch]$ForceManagedGit
 )
 
 $ErrorActionPreference = "Stop"
@@ -96,8 +98,10 @@ function Install-MinGit {
 
 function Resolve-Git {
   param([string]$RuntimeDir)
-  $cmd = Get-Command git -ErrorAction SilentlyContinue
-  if ($cmd) { return $cmd.Source }
+  if (-not $ForceManagedGit) {
+    $cmd = Get-Command git -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+  }
   return Install-MinGit -RuntimeDir $RuntimeDir
 }
 
@@ -152,7 +156,7 @@ New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 $bossCmd = Join-Path $binDir "boss.cmd"
 Set-Content -LiteralPath $bossCmd -Value "@echo off`r`n`"$($node.node)`" `"$cliJs`" %*`r`n" -Encoding ASCII
 
-$npmBin = Join-Path $env:APPDATA "npm"
+$npmBin = $WindowsNpmBinDir
 New-Item -ItemType Directory -Force -Path $npmBin | Out-Null
 Set-Content -LiteralPath (Join-Path $npmBin "boss.cmd") -Value "@echo off`r`n`"$($node.node)`" `"$cliJs`" %*`r`n" -Encoding ASCII
 

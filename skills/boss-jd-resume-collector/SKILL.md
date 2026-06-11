@@ -15,10 +15,21 @@ description: 当用户想输入 JD/岗位描述并采集 BOSS 直聘候选人简
 
 所有 bootstrap 和采集命令都必须在非 sandbox 环境执行：它们会访问网络、写入 `~/.boss-cli`、写入 `%APPDATA%\npm\boss.cmd`、启动/复用 BOSS 浏览器会话。
 
+拿到单个 `boss-jd-resume-collector.zip` 后，先解压到 Codex skills 目录：
+
+```powershell
+$skillsDir = Join-Path $HOME ".codex\skills"
+New-Item -ItemType Directory -Force -Path $skillsDir | Out-Null
+Expand-Archive -LiteralPath ".\boss-jd-resume-collector.zip" -DestinationPath $skillsDir -Force
+Test-Path (Join-Path $skillsDir "boss-jd-resume-collector\SKILL.md")
+```
+
+最后一行必须输出 `True`。如果不是 `True`，说明 zip 没有解到正确目录，不要继续 bootstrap。
+
 首次使用先运行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "<skill_dir>\scripts\bootstrap_boss_cli.ps1"
+powershell -ExecutionPolicy Bypass -File "$HOME\.codex\skills\boss-jd-resume-collector\scripts\bootstrap_boss_cli.ps1"
 ```
 
 bootstrap 会执行单一路径安装：
@@ -33,7 +44,7 @@ bootstrap 会执行单一路径安装：
 如需要指定分支或仓库：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "<skill_dir>\scripts\bootstrap_boss_cli.ps1" -RepoRef codex-resume-sync -RepoUrl https://github.com/monster1389/boss-cli
+powershell -ExecutionPolicy Bypass -File "$HOME\.codex\skills\boss-jd-resume-collector\scripts\bootstrap_boss_cli.ps1" -RepoRef codex-resume-sync -RepoUrl https://github.com/monster1389/boss-cli
 ```
 
 ## 采集流程
