@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""根据一份 JD 从 BOSS 三个来源各采集 3 份可用简历。"""
+"""根据一份 JD 从 BOSS chat/recommend 来源各采集 3 份可用简历。"""
 
 from __future__ import annotations
 
@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any
 
 
-SOURCES = ("chat", "recommend", "deep-search")
+DEFAULT_SOURCES = ("chat", "recommend")
+ALL_SOURCES = ("chat", "recommend", "deep-search")
 USABLE_STATUSES = {"downloaded", "skipped_existing"}
 FAILURE_KINDS = {
     "boss_not_found",
@@ -43,6 +44,15 @@ def default_runs_root() -> Path:
 
 def default_windows_boss_cmd() -> Path:
     return user_home() / "AppData" / "Roaming" / "npm" / "boss.cmd"
+
+
+def default_skill_toolchain_manifest() -> Path:
+    return user_home() / ".boss-cli" / "toolchain" / "boss-command.json"
+
+
+def default_managed_boss_cmd() -> Path:
+    suffix = ".cmd" if os.name == "nt" else ""
+    return user_home() / ".boss-cli" / "bin" / f"boss{suffix}"
 
 
 def safe_path_exists(path: Path) -> tuple[bool, str | None]:
@@ -101,6 +111,39 @@ def resolve_boss_bin(explicit_boss_bin: str | None) -> tuple[str | None, dict[st
     env_boss_bin = os.environ.get("BOSS_BIN", "").strip()
     if env_boss_bin and env_boss_bin != explicit_boss_bin:
         candidates.append(("environment", env_boss_bin))
+    manifest_path = default_skill_toolchain_manifest()
+    manifest_exists, manifest_error = safe_path_exists(manifest_path)
+    if manifest_exists:
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest_boss_bin = str(manifest.get("boss_bin") or "").strip()
+            if manifest_boss_bin:
+                candidates.append(("skill_toolchain_manifest", manifest_boss_bin))
+        except (OSError, json.JSONDecodeError) as exc:
+            attempts.append({
+                "source": "skill_toolchain_manifest",
+                "candidate": str(manifest_path),
+                "ok": False,
+                "error": str(exc),
+            })
+    elif manifest_error:
+        attempts.append({
+            "source": "skill_toolchain_manifest",
+            "candidate": str(manifest_path),
+            "ok": False,
+            "error": manifest_error,
+        })
+    managed_boss = default_managed_boss_cmd()
+    managed_exists, managed_error = safe_path_exists(managed_boss)
+    if managed_exists:
+        candidates.append(("skill_managed_bin", str(managed_boss)))
+    elif managed_error:
+        attempts.append({
+            "source": "skill_managed_bin",
+            "candidate": str(managed_boss),
+            "ok": False,
+            "error": managed_error,
+        })
     path_boss = shutil.which("boss")
     if path_boss:
         candidates.append(("path", path_boss))
@@ -429,7 +472,7 @@ def write_summary(path: Path, manifest: dict[str, Any]) -> None:
             lines.append(f"  - {check['message']}")
 
     lines.extend(["", "## 来源采集结果", ""])
-    for source in SOURCES:
+    for source in manifest["requested_sources"]:
         result = manifest["sources"][source]
         lines.append(
             f"- {source}: 可用={result['usable_count']}/3, "
@@ -456,17 +499,19 @@ def build_manifest(
     boss_info: dict[str, Any],
     preflight: dict[str, Any],
     sources: dict[str, dict[str, Any]],
+    requested_sources: tuple[str, ...],
 ) -> dict[str, Any]:
     items = flatten_items(sources)
-    source_usable_counts = {source: sources[source]["usable_count"] for source in SOURCES}
+    source_usable_counts = {source: sources[source]["usable_count"] for source in requested_sources}
     failed_sources = [
         source
-        for source in SOURCES
+        for source in requested_sources
         if sources[source]["usable_count"] != 3 or bool(sources[source].get("errors"))
     ]
     return {
-        "ok": preflight["ok"] and all(source_usable_counts[source] == 3 and not sources[source]["errors"] for source in SOURCES),
+        "ok": preflight["ok"] and all(source_usable_counts[source] == 3 and not sources[source]["errors"] for source in requested_sources),
         "created_at": datetime.now().isoformat(timespec="seconds"),
+        "requested_sources": list(requested_sources),
         "run_dir": str(run_dir),
         "resume_root": str(resume_root),
         "boss": boss_info,
@@ -501,7 +546,13 @@ def main() -> int:
     parser.add_argument("--boss-bin")
     parser.add_argument("--resume-root", default=str(default_resume_root()))
     parser.add_argument("--runs-root", default=str(default_runs_root()))
+    parser.add_argument(
+        "--include-deep-search",
+        action="store_true",
+        help="同时采集 deep-search。默认只要求 chat/recommend，避免深搜页不可用阻断整轮。",
+    )
     args = parser.parse_args()
+    requested_sources = ALL_SOURCES if args.include_deep_search else DEFAULT_SOURCES
 
     jd_text, jd_source = read_jd(args)
     job_keyword = (args.job_keyword or "").strip() or infer_job_keyword(jd_text)
@@ -526,12 +577,12 @@ def main() -> int:
             "failure_kind": "boss_not_found",
             "message": boss_info["message"],
         }
-        sources = {source: empty_source_result(source, "boss_not_found", boss_info["message"]) for source in SOURCES}
+        sources = {source: empty_source_result(source, "boss_not_found", boss_info["message"]) for source in requested_sources}
     else:
         preflight = run_preflight(boss_bin, job_keyword)
         sources = {}
         if preflight["ok"]:
-            for source in SOURCES:
+            for source in requested_sources:
                 result = run_boss_resumes(boss_bin, source, resume_root, job_keyword)
                 usable_count, errors, failure_kind = validate_source_result(result)
                 result["usable_count"] = usable_count
@@ -541,7 +592,7 @@ def main() -> int:
         else:
             message = preflight.get("message") or "采集前自检失败"
             failure_kind = preflight.get("failure_kind") or "unknown"
-            sources = {source: empty_source_result(source, failure_kind, message) for source in SOURCES}
+            sources = {source: empty_source_result(source, failure_kind, message) for source in requested_sources}
 
     manifest = build_manifest(
         run_dir=run_dir,
@@ -552,6 +603,7 @@ def main() -> int:
         boss_info=boss_info,
         preflight=preflight,
         sources=sources,
+        requested_sources=requested_sources,
     )
     manifest_path, summary_path = write_outputs(run_dir, manifest)
 
