@@ -86,20 +86,20 @@ function Resolve-BossBin {
   }
 }
 
-function Run-CommandJson([string]$FilePath, [string[]]$Args) {
-  $stdout = New-TemporaryFile
+function Run-CommandJson([string]$FilePath, [string[]]$CommandArgs) {
   $stderr = New-TemporaryFile
   try {
-    $process = Start-Process -FilePath $FilePath -ArgumentList $Args -NoNewWindow -PassThru -Wait -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    $stdoutText = (& $FilePath @CommandArgs 2> $stderr | Out-String)
+    $exitCode = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }
     return @{
-      ok = ($process.ExitCode -eq 0)
-      command = @($FilePath) + $Args
-      exit_code = $process.ExitCode
-      stdout = Get-Content -Raw -Encoding UTF8 -LiteralPath $stdout
+      ok = ($exitCode -eq 0)
+      command = @($FilePath) + $CommandArgs
+      exit_code = $exitCode
+      stdout = $stdoutText
       stderr = Get-Content -Raw -Encoding UTF8 -LiteralPath $stderr
     }
   } finally {
-    Remove-Item -LiteralPath $stdout,$stderr -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $stderr -Force -ErrorAction SilentlyContinue
   }
 }
 
@@ -125,12 +125,12 @@ function Run-Preflight([string]$Boss, [string]$Keyword) {
   )
   $results = @()
   foreach ($check in $checks) {
-    $result = Run-CommandJson $Boss $check.args
+    $result = Run-CommandJson $Boss $check["args"]
     $combined = "$($result.stdout)`n$($result.stderr)"
-    $result.name = $check.name
+    $result.name = $check["name"]
     if (-not $result.ok) {
       $result.failure_kind = Classify-Failure $combined
-      $result.message = if ($result.stderr) { $result.stderr } elseif ($result.stdout) { $result.stdout } else { "$($check.name) failed" }
+      $result.message = if ($result.stderr) { $result.stderr } elseif ($result.stdout) { $result.stdout } else { "$($check["name"]) failed" }
     } else {
       $result.failure_kind = $null
       $result.message = ""
@@ -147,10 +147,10 @@ function Run-Preflight([string]$Boss, [string]$Keyword) {
 }
 
 function Run-BossResumes([string]$Boss, [string]$Source, [string]$Root, [string]$Keyword) {
-  $args = @("resumes", "--from", $Source, "--limit", "3", "--root", $Root, "--json")
-  if ($Source -eq "recommend" -and $Keyword) { $args += @("--job", $Keyword) }
-  if ($Source -eq "deep-search" -and $Keyword) { $args += @("--job", $Keyword, "--search") }
-  $completed = Run-CommandJson $Boss $args
+  $resumeArgs = @("resumes", "--from", $Source, "--limit", "3", "--root", $Root, "--json")
+  if ($Source -eq "recommend" -and $Keyword) { $resumeArgs += @("--job", $Keyword) }
+  if ($Source -eq "deep-search" -and $Keyword) { $resumeArgs += @("--job", $Keyword, "--search") }
+  $completed = Run-CommandJson $Boss $resumeArgs
   if (-not $completed.ok) {
     $combined = "$($completed.stdout)`n$($completed.stderr)"
     return @{
@@ -168,7 +168,7 @@ function Run-BossResumes([string]$Boss, [string]$Source, [string]$Root, [string]
     }
   }
   try {
-    $parsed = $completed.stdout | ConvertFrom-Json -Depth 100
+    $parsed = ConvertFrom-Json -InputObject $completed["stdout"]
   } catch {
     return @{
       ok = $false
@@ -196,7 +196,7 @@ function Run-BossResumes([string]$Boss, [string]$Source, [string]$Root, [string]
 function Validate-Source([hashtable]$Result) {
   $errors = @()
   $usable = 0
-  foreach ($item in @($Result.results)) {
+  foreach ($item in @($Result["results"])) {
     $status = [string]$item.status
     $artifacts = $item.artifacts
     $resumeMd = if ($artifacts) { [string]$artifacts.resumeMarkdownPath } else { "" }
@@ -209,8 +209,8 @@ function Validate-Source([hashtable]$Result) {
       $errors += "$name`: $status - $message"
     }
   }
-  if ($usable -ne 3) { $errors += "$($Result.source): expected 3 usable resumes, got $usable" }
-  $failureKind = if ($Result.failure_kind) { $Result.failure_kind } elseif ($usable -ne 3) { "insufficient_data" } elseif ($errors.Count) { "candidate_download_failed" } else { $null }
+  if ($usable -ne 3) { $errors += "$($Result["source"]): expected 3 usable resumes, got $usable" }
+  $failureKind = if ($Result["failure_kind"]) { $Result["failure_kind"] } elseif ($usable -ne 3) { "insufficient_data" } elseif ($errors.Count) { "candidate_download_failed" } else { $null }
   return @{ usable_count = $usable; errors = $errors; failure_kind = $failureKind }
 }
 
@@ -238,9 +238,9 @@ if (-not $bossInfo.ok) {
     foreach ($source in $RequestedSources) {
       $result = Run-BossResumes $bossInfo.selected $source $ResumeRoot $keyword
       $validated = Validate-Source $result
-      $result.usable_count = $validated.usable_count
-      $result.errors = $validated.errors
-      $result.failure_kind = $validated.failure_kind
+      $result["usable_count"] = $validated["usable_count"]
+      $result["errors"] = $validated["errors"]
+      $result["failure_kind"] = $validated["failure_kind"]
       $sources[$source] = $result
     }
   } else {
@@ -254,9 +254,9 @@ $items = @()
 $sourceCounts = @{}
 $failedSources = @()
 foreach ($source in $RequestedSources) {
-  $sourceCounts[$source] = $sources[$source].usable_count
-  if ($sources[$source].usable_count -ne 3 -or @($sources[$source].errors).Count) { $failedSources += $source }
-  foreach ($item in @($sources[$source].results)) {
+  $sourceCounts[$source] = $sources[$source]["usable_count"]
+  if ($sources[$source]["usable_count"] -ne 3 -or @($sources[$source]["errors"]).Count) { $failedSources += $source }
+  foreach ($item in @($sources[$source]["results"])) {
     $artifacts = $item.artifacts
     $items += [ordered]@{
       source = $source
@@ -310,7 +310,7 @@ $summary = @(
   "- failure_kind: $($preflight.failure_kind)"
 )
 foreach ($source in $RequestedSources) {
-  $summary += "- $source`: usable=$($sources[$source].usable_count)/3, failure_kind=$($sources[$source].failure_kind)"
+  $summary += "- $source`: usable=$($sources[$source]["usable_count"])/3, failure_kind=$($sources[$source]["failure_kind"])"
 }
 Set-Content -LiteralPath $summaryPath -Value ($summary -join "`n") -Encoding UTF8
 
