@@ -5,6 +5,7 @@ param(
   [string]$BossBin = "",
   [string]$ResumeRoot = "$HOME\.boss-cli\resumes",
   [string]$RunsRoot = "$HOME\.boss-cli\runs",
+  [int]$CommandTimeoutSeconds = 900,
   [switch]$IncludeDeepSearch
 )
 
@@ -62,10 +63,12 @@ function Resolve-BossBin {
   }
   $managed = Join-Path $HOME ".boss-cli\bin\boss.cmd"
   if (Test-Path $managed) { $candidates += @{ source = "skill_managed_bin"; value = $managed } }
-  $pathBoss = Get-Command boss -ErrorAction SilentlyContinue
-  if ($pathBoss) { $candidates += @{ source = "path"; value = $pathBoss.Source } }
   $globalBoss = Join-Path $env:APPDATA "npm\boss.cmd"
   if (Test-Path $globalBoss) { $candidates += @{ source = "windows_npm_global"; value = $globalBoss } }
+  $pathBossCmd = Get-Command boss.cmd -ErrorAction SilentlyContinue
+  if ($pathBossCmd) { $candidates += @{ source = "path_cmd"; value = $pathBossCmd.Source } }
+  $pathBoss = Get-Command boss -ErrorAction SilentlyContinue
+  if ($pathBoss) { $candidates += @{ source = "path"; value = $pathBoss.Source } }
 
   $seen = @{}
   foreach ($candidate in $candidates) {
@@ -86,20 +89,53 @@ function Resolve-BossBin {
   }
 }
 
-function Run-CommandJson([string]$FilePath, [string[]]$CommandArgs) {
-  $stderr = New-TemporaryFile
+function Quote-ProcessArgument([string]$Value) {
+  if ($Value -notmatch '[\s"]') { return $Value }
+  return '"' + ($Value -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
+}
+
+function Run-CommandJson([string]$FilePath, [string[]]$CommandArgs, [int]$TimeoutSeconds) {
+  $process = [System.Diagnostics.Process]::new()
+  $commandLine = ((@($FilePath) + $CommandArgs) | ForEach-Object { Quote-ProcessArgument $_ }) -join " "
+  if ([IO.Path]::GetExtension($FilePath).ToLowerInvariant() -in @(".cmd", ".bat")) {
+    $process.StartInfo.FileName = $env:ComSpec
+    $process.StartInfo.Arguments = "/d /s /c " + (Quote-ProcessArgument $commandLine)
+  } else {
+    $process.StartInfo.FileName = $FilePath
+    $process.StartInfo.Arguments = (($CommandArgs | ForEach-Object { Quote-ProcessArgument $_ }) -join " ")
+  }
+  $process.StartInfo.UseShellExecute = $false
+  $process.StartInfo.RedirectStandardOutput = $true
+  $process.StartInfo.RedirectStandardError = $true
+  $process.StartInfo.CreateNoWindow = $true
   try {
-    $stdoutText = (& $FilePath @CommandArgs 2> $stderr | Out-String)
-    $exitCode = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }
+    [void]$process.Start()
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+      $process.Kill()
+      $process.WaitForExit()
+      return @{
+        ok = $false
+        command = @($FilePath) + $CommandArgs
+        exit_code = $null
+        stdout = $stdoutTask.Result
+        stderr = $stderrTask.Result
+        timed_out = $true
+        failure_kind = "command_timeout"
+        message = "command timed out after $TimeoutSeconds seconds"
+      }
+    }
     return @{
-      ok = ($exitCode -eq 0)
+      ok = ($process.ExitCode -eq 0)
       command = @($FilePath) + $CommandArgs
-      exit_code = $exitCode
-      stdout = $stdoutText
-      stderr = Get-Content -Raw -Encoding UTF8 -LiteralPath $stderr
+      exit_code = $process.ExitCode
+      stdout = $stdoutTask.Result
+      stderr = $stderrTask.Result
+      timed_out = $false
     }
   } finally {
-    Remove-Item -LiteralPath $stderr -Force -ErrorAction SilentlyContinue
+    $process.Dispose()
   }
 }
 
@@ -117,7 +153,7 @@ function Classify-Failure([string]$Text, [int]$UsableCount = -1) {
   return "unknown"
 }
 
-function Run-Preflight([string]$Boss, [string]$Keyword) {
+function Run-Preflight([string]$Boss, [string]$Keyword, [int]$TimeoutSeconds) {
   $checks = @(
     @{ name = "boss_help"; args = @("help") },
     @{ name = "recommend_page"; args = @("recommend", $Keyword) },
@@ -125,12 +161,12 @@ function Run-Preflight([string]$Boss, [string]$Keyword) {
   )
   $results = @()
   foreach ($check in $checks) {
-    $result = Run-CommandJson $Boss $check["args"]
+    $result = Run-CommandJson $Boss $check["args"] $TimeoutSeconds
     $combined = "$($result.stdout)`n$($result.stderr)"
     $result.name = $check["name"]
     if (-not $result.ok) {
-      $result.failure_kind = Classify-Failure $combined
-      $result.message = if ($result.stderr) { $result.stderr } elseif ($result.stdout) { $result.stdout } else { "$($check["name"]) failed" }
+      $result.failure_kind = if ($result.failure_kind) { $result.failure_kind } else { Classify-Failure $combined }
+      $result.message = if ($result.message) { $result.message } elseif ($result.stderr) { $result.stderr } elseif ($result.stdout) { $result.stdout } else { "$($check["name"]) failed" }
     } else {
       $result.failure_kind = $null
       $result.message = ""
@@ -146,11 +182,11 @@ function Run-Preflight([string]$Boss, [string]$Keyword) {
   }
 }
 
-function Run-BossResumes([string]$Boss, [string]$Source, [string]$Root, [string]$Keyword) {
+function Run-BossResumes([string]$Boss, [string]$Source, [string]$Root, [string]$Keyword, [int]$TimeoutSeconds) {
   $resumeArgs = @("resumes", "--from", $Source, "--limit", "3", "--root", $Root, "--json")
   if ($Source -eq "recommend" -and $Keyword) { $resumeArgs += @("--job", $Keyword) }
   if ($Source -eq "deep-search" -and $Keyword) { $resumeArgs += @("--job", $Keyword, "--search") }
-  $completed = Run-CommandJson $Boss $resumeArgs
+  $completed = Run-CommandJson $Boss $resumeArgs $TimeoutSeconds
   if (-not $completed.ok) {
     $combined = "$($completed.stdout)`n$($completed.stderr)"
     return @{
@@ -163,8 +199,8 @@ function Run-BossResumes([string]$Boss, [string]$Source, [string]$Root, [string]
       results = @()
       counts = @{}
       usable_count = 0
-      failure_kind = Classify-Failure $combined
-      errors = @($(if ($completed.stderr.Trim()) { $completed.stderr.Trim() } else { $completed.stdout.Trim() }))
+      failure_kind = if ($completed.failure_kind) { $completed.failure_kind } else { Classify-Failure $combined }
+      errors = @($(if ($completed.message) { $completed.message } elseif ($completed.stderr.Trim()) { $completed.stderr.Trim() } else { $completed.stdout.Trim() }))
     }
   }
   try {
@@ -233,10 +269,10 @@ if (-not $bossInfo.ok) {
     $sources[$source] = @{ ok = $false; source = $source; command = @(); exit_code = $null; stdout = ""; stderr = ""; results = @(); counts = @{}; usable_count = 0; failure_kind = "boss_not_found"; errors = @($bossInfo.message) }
   }
 } else {
-  $preflight = Run-Preflight $bossInfo.selected $keyword
+  $preflight = Run-Preflight $bossInfo.selected $keyword $CommandTimeoutSeconds
   if ($preflight.ok) {
     foreach ($source in $RequestedSources) {
-      $result = Run-BossResumes $bossInfo.selected $source $ResumeRoot $keyword
+      $result = Run-BossResumes $bossInfo.selected $source $ResumeRoot $keyword $CommandTimeoutSeconds
       $validated = Validate-Source $result
       $result["usable_count"] = $validated["usable_count"]
       $result["errors"] = $validated["errors"]
@@ -282,6 +318,7 @@ $manifest = [ordered]@{
   boss = $bossInfo
   preflight = $preflight
   jd = @{ source = $jd.source; path = $jdPath; job_keyword = $keyword }
+  command_timeout_seconds = $CommandTimeoutSeconds
   sources = $sources
   items = $items
   unique_items = $items

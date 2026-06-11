@@ -60,6 +60,12 @@ powershell -ExecutionPolicy Bypass -File "$HOME\.codex\skills\boss-jd-resume-col
 powershell -ExecutionPolicy Bypass -File "<skill_dir>\scripts\collect_boss_resumes.ps1" -JdFile "<jd.md>" -JobKeyword "<keyword>"
 ```
 
+默认每个 `boss` 子命令最多等待 900 秒。需要调整时显式传入：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "<skill_dir>\scripts\collect_boss_resumes.ps1" -JdFile "<jd.md>" -JobKeyword "<keyword>" -CommandTimeoutSeconds 900
+```
+
 已有 Python 环境时也可以使用同等 Python 入口：
 
 ```bash
