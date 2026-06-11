@@ -5,6 +5,7 @@ import { clickBossSidebarMenuToPath } from '../common/boss_sidebar_nav.js';
 const BOSS_CHAT_RECOMMEND_URL = 'https://www.zhipin.com/web/chat/recommend';
 
 export type RecommendCandidate = {
+  listIndex: number;
   geekId: string;
   name: string;
   salary: string;
@@ -187,10 +188,10 @@ export async function selectRecommendJob(frame: Frame, keyword: string): Promise
 
 export async function ensureInRecommendPage(page: Page): Promise<Frame> {
   if (!isBossChatRecommendUrl(page.url())) {
-    await clickBossSidebarMenuToPath(page, '推荐', '/web/chat/recommend');
+    await page.goto(BOSS_CHAT_RECOMMEND_URL, { waitUntil: 'load', timeout: 60_000 });
   }
   if (!isBossChatRecommendUrl(page.url())) {
-    throw new Error('通过侧边栏“推荐”进入页面失败，请确认已登录并可访问 /web/chat/recommend。');
+    throw new Error('进入推荐页失败，请确认已登录并可访问 /web/chat/recommend。');
   }
   const frame = await getRecommendFrame(page);
   await ensureRecommendFrameReady(frame);
@@ -213,8 +214,10 @@ export async function readRecommendList(frame: Frame): Promise<RecommendCandidat
   return (await frame.evaluate(`(() => {
     const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
     const cardSel = ${JSON.stringify(RECOMMEND_CARD_ROOT_SELECTOR)};
-    const cards = Array.from(document.querySelectorAll(cardSel));
-    return cards.map((item) => {
+    const cards = Array.from(document.querySelectorAll(cardSel)).filter(
+      (item) => !item.parentElement?.closest(cardSel),
+    );
+    return cards.map((item, index) => {
       const inner = item.querySelector(".card-inner") || item;
       const wrap = item.matches(".candidate-card-wrap")
         ? item
@@ -262,6 +265,7 @@ export async function readRecommendList(frame: Frame): Promise<RecommendCandidat
         });
       })();
       return {
+        listIndex: index,
         geekId,
         name,
         salary,
@@ -340,7 +344,9 @@ export async function clickGreet(
       const raw = ${targetLiteral};
       const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
       const cardSel = ${JSON.stringify(RECOMMEND_CARD_ROOT_SELECTOR)};
-      const cards = Array.from(document.querySelectorAll(cardSel));
+      const cards = Array.from(document.querySelectorAll(cardSel)).filter(
+        (item) => !item.parentElement?.closest(cardSel),
+      );
       if (cards.length === 0) {
         return { kind: "empty" };
       }
@@ -419,52 +425,63 @@ export function markGreetProduced(
  * 父页随后出现 `c-resume` iframe（如 `source=recommend`）。旧版仅有「在线简历」链接时仍尝试点击链接。
  */
 export async function openRecommendResumePreview(frame: Frame, target: string): Promise<boolean> {
-  const raw = target.trim();
+  return openRecommendResumePreviewByCandidate(frame, { name: target.trim() });
+}
+
+export async function openRecommendResumePreviewByCandidate(
+  frame: Frame,
+  candidate: { name: string; geekId?: string; listIndex?: number },
+): Promise<boolean> {
+  const raw = candidate.name.trim();
   const targetLiteral = JSON.stringify(raw);
-  return (await frame.evaluate(`(() => {
+  const geekIdLiteral = JSON.stringify(candidate.geekId?.trim() || '');
+  const listIndexLiteral =
+    typeof candidate.listIndex === 'number' && candidate.listIndex >= 0
+      ? String(candidate.listIndex)
+      : 'null';
+  const targetIndex = (await frame.evaluate(`(() => {
     const raw = ${targetLiteral};
+    const targetGeekId = ${geekIdLiteral};
+    const targetIndex = ${listIndexLiteral};
     const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
     const cardSel = ${JSON.stringify(RECOMMEND_CARD_ROOT_SELECTOR)};
-    const cards = Array.from(document.querySelectorAll(cardSel));
-    if (cards.length === 0) return false;
-    const targetCard = cards.find((item) => {
+    const allCards = Array.from(document.querySelectorAll(cardSel));
+    const cards = allCards.filter(
+      (item) => !item.parentElement?.closest(cardSel),
+    );
+    if (cards.length === 0) return -1;
+    const targetCard = cards.find((item, index) => {
+      const inner = item.querySelector(".card-inner") || item;
+      const geekId =
+        inner?.getAttribute("data-geekid") ??
+        inner?.getAttribute("data-geek") ??
+        "";
+      if (targetGeekId && geekId === targetGeekId) return true;
+      if (targetIndex !== null && index === targetIndex) return true;
       const name =
         norm(item.querySelector(".name-wrap .name")?.textContent) ||
         norm(item.querySelector(".name")?.textContent);
       return name === raw || name.includes(raw);
     }) ?? null;
-    if (!targetCard) return false;
-
-    function tryOpen(el) {
-      if (!(el instanceof HTMLElement)) return false;
-      if (el.classList.contains("disabled")) return false;
-      const st = window.getComputedStyle(el);
-      if (st.pointerEvents === "none" || Number(st.opacity) < 0.3) return false;
-      el.scrollIntoView({ block: "center", inline: "nearest" });
-      el.click();
-      return true;
-    }
-
-    const inner = targetCard.querySelector(".card-inner");
-    if (inner instanceof HTMLElement) {
-      inner.scrollIntoView({ block: "center", inline: "nearest" });
-      inner.click();
-      return true;
-    }
-
-    const resumeOnline = targetCard.querySelector("a.resume-btn-online");
-    if (tryOpen(resumeOnline)) return true;
-    const hrefResume = targetCard.querySelector('a[href*="c-resume"], a[href*="frame/c-resume"]');
-    if (tryOpen(hrefResume)) return true;
-
-    const links = Array.from(targetCard.querySelectorAll("a, button, .btn")).filter((node) => {
-      const t = norm(node.textContent);
-      return /在线简历|查看简历|简历预览|预览/.test(t);
-    });
-    if (links.length > 0 && tryOpen(links[0])) return true;
-
+    if (!targetCard) return -1;
+    return allCards.indexOf(targetCard);
+  })()`)) as number;
+  if (targetIndex < 0) {
     return false;
-  })()`)) as boolean;
+  }
+  const cards = await frame.$$(RECOMMEND_CARD_ROOT_SELECTOR);
+  const targetCard = cards[targetIndex];
+  if (!targetCard) {
+    return false;
+  }
+  try {
+    const inner = await targetCard.$('.card-inner');
+    await (inner ?? targetCard).click();
+    await inner?.dispose().catch(() => {});
+    return true;
+  } finally {
+    await Promise.all(cards.map((card) => card.dispose().catch(() => {})));
+  }
 }
 
 export async function runRecommend(jobKeyword?: string): Promise<string> {

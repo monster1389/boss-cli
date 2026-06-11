@@ -13,7 +13,13 @@ type SearchFormSnapshot = {
   remainingCountText: string;
 };
 
+export type DeepSearchRunContext = SearchFormSnapshot & {
+  requestedJobKeyword: string;
+  resultUrl: string;
+};
+
 export type DeepSearchGeekItem = {
+  listIndex: number;
   name: string;
   meta: string;
   work: string;
@@ -752,7 +758,7 @@ async function applyLinesToSection(page: Page, titleKeyword: string, lines: stri
   }
 }
 
-async function applyAiFormRequirementLists(
+export async function applyAiFormRequirementLists(
   page: Page,
   opts: { core?: string[]; bonus?: string[] },
 ): Promise<void> {
@@ -764,7 +770,7 @@ async function applyAiFormRequirementLists(
   }
 }
 
-async function readSearchFormSnapshot(page: Page): Promise<SearchFormSnapshot> {
+export async function readSearchFormSnapshot(page: Page): Promise<SearchFormSnapshot> {
   return (await page.evaluate(`(() => {
     const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
     function itemLineText(item) {
@@ -948,10 +954,137 @@ export async function readAiFormSelectedJobLabel(page: Page): Promise<string> {
  * 在深度搜索（aiform）主文档中按姓名打开在线简历预览（与 {@link clickGreetDeepSearch} 同一卡片集合，排除「继续沟通」）。
  */
 export async function openDeepSearchResumePreview(page: Page, target: string): Promise<boolean> {
-  const raw = target.trim();
+  return openDeepSearchResumePreviewByCandidate(page, { name: target.trim() });
+}
+
+function normalizeSearchCondition(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function assertRequestedConditionsApplied(
+  snapshot: SearchFormSnapshot,
+  requested: { core?: string[]; bonus?: string[] },
+): void {
+  const actualCore = new Set(snapshot.coreRequirements.map(normalizeSearchCondition));
+  const actualBonus = new Set(snapshot.bonusRequirements.map(normalizeSearchCondition));
+  const missingCore = (requested.core ?? [])
+    .map(normalizeSearchCondition)
+    .filter((item) => item && !actualCore.has(item));
+  const missingBonus = (requested.bonus ?? [])
+    .map(normalizeSearchCondition)
+    .filter((item) => item && !actualBonus.has(item));
+  if (missingCore.length > 0 || missingBonus.length > 0) {
+    throw new Error(
+      `深度搜索表单校验失败：未写入核心要求 ${missingCore.join('｜') || '无'}；未写入加分项 ${missingBonus.join('｜') || '无'}。`,
+    );
+  }
+}
+
+async function clickAiFormImmediateMatch(page: Page): Promise<void> {
+  const clicked = (await page.evaluate(`(() => {
+    const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
+    const button = document.querySelector(".ai-form-match-footer .btn-ai-match-v2, .btn-ai-match-v2");
+    if (!(button instanceof HTMLElement)) {
+      return { ok: false, reason: "missing" };
+    }
+    const text = norm(button.textContent);
+    const cls = button.className || "";
+    const disabled =
+      button.getAttribute("disabled") !== null ||
+      button.getAttribute("aria-disabled") === "true" ||
+      /disabled|forbid|ban/i.test(cls) ||
+      Number(window.getComputedStyle(button).opacity) < 0.3;
+    if (disabled) {
+      return { ok: false, reason: "disabled", text };
+    }
+    button.scrollIntoView({ block: "center", inline: "nearest" });
+    button.click();
+    return { ok: true, text };
+  })()`)) as { ok: boolean; reason?: string; text?: string };
+  if (!clicked.ok) {
+    throw new Error(`无法点击深度搜索「立即匹配」按钮：${clicked.reason || 'unknown'}${clicked.text ? `（${clicked.text}）` : ''}。`);
+  }
+}
+
+async function waitForSearchResultPage(page: Page): Promise<string> {
+  await page.waitForFunction(
+    `(() => {
+      try {
+        const u = new URL(window.location.href);
+        return u.hostname.includes("zhipin.com") && u.pathname.replace(/\\/+$/, "") === "/web/chat/search";
+      } catch {
+        return false;
+      }
+    })()`,
+    { timeout: 30_000 },
+  );
+  await page.waitForFunction(
+    `(() => {
+      const iframe = document.querySelector('iframe[name="searchFrame"], iframe[src*="/web/frame/search/"]');
+      return !!iframe;
+    })()`,
+    { timeout: 20_000 },
+  );
+  return page.url();
+}
+
+export async function runDeepSearchMatchOnPage(
+  page: Page,
+  opts: {
+    jobKeyword: string;
+    coreRequirements?: string[];
+    bonusRequirements?: string[];
+  },
+): Promise<DeepSearchRunContext> {
+  const jobKeyword = opts.jobKeyword.trim();
+  if (!jobKeyword) {
+    throw new Error('深度搜索真实匹配必须指定岗位关键字。');
+  }
+  if (!isBossChatAiFormUrl(page.url())) {
+    await clickBossSidebarMenuToPath(page, '深度搜索', '/web/chat/aiform');
+  }
+  if (!isBossChatAiFormUrl(page.url())) {
+    throw new Error('通过侧边栏“深度搜索”进入页面失败，请确认已登录并可访问 /web/chat/aiform。');
+  }
+  await ensureInDeepSearchPage(page);
+  await selectAiFormJob(page, jobKeyword);
+  await ensureInDeepSearchPage(page);
+
+  if (opts.coreRequirements !== undefined || opts.bonusRequirements !== undefined) {
+    await applyAiFormRequirementLists(page, {
+      core: opts.coreRequirements,
+      bonus: opts.bonusRequirements,
+    });
+    await ensureInDeepSearchPage(page);
+  }
+
+  const snapshot = await readSearchFormSnapshot(page);
+  assertRequestedConditionsApplied(snapshot, {
+    core: opts.coreRequirements,
+    bonus: opts.bonusRequirements,
+  });
+  await clickAiFormImmediateMatch(page);
+  const resultUrl = await waitForSearchResultPage(page);
+  return {
+    ...snapshot,
+    requestedJobKeyword: jobKeyword,
+    resultUrl,
+  };
+}
+
+export async function openDeepSearchResumePreviewByCandidate(
+  page: Page,
+  candidate: { name: string; listIndex?: number },
+): Promise<boolean> {
+  const raw = candidate.name.trim();
+  const targetIndexLiteral =
+    typeof candidate.listIndex === 'number' && candidate.listIndex >= 0
+      ? String(candidate.listIndex)
+      : 'null';
   const targetLiteral = JSON.stringify(raw);
   return (await page.evaluate(`(() => {
     const raw = ${targetLiteral};
+    const targetIndex = ${targetIndexLiteral};
     const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
     const allCards = Array.from(
       document.querySelectorAll(".geeks-box .geek-card-item, .geek-card-list .geek-card-item"),
@@ -963,7 +1096,8 @@ export async function openDeepSearchResumePreview(page: Page, target: string): P
     });
     if (cards.length === 0) return false;
     const targetCard =
-      cards.find((item) => {
+      cards.find((item, index) => {
+        if (targetIndex !== null && index === targetIndex) return true;
         const name = norm(item.querySelector(".geek-name")?.textContent);
         return name === raw || name.includes(raw);
       }) ?? null;
@@ -1015,7 +1149,7 @@ export async function readDeepSearchGeekList(page: Page): Promise<DeepSearchGeek
       document.querySelectorAll(".geeks-box .geek-card-item, .geek-card-list .geek-card-item"),
     );
     return items
-      .map((item) => {
+      .map((item, index) => {
         const chatLabel = norm(item.querySelector(".geek-chat")?.textContent);
         if (chatLabel.includes("继续沟通")) {
           return null;
@@ -1032,7 +1166,7 @@ export async function readDeepSearchGeekList(page: Page): Promise<DeepSearchGeek
         if (recEl) {
           reason = norm(recEl.textContent).replace(/^推荐理由\\s*/, "").trim();
         }
-        return { name, meta, work, edu, reason };
+        return { listIndex: index, name, meta, work, edu, reason };
       })
       .filter((x) => x !== null);
   })()`)) as DeepSearchGeekItem[];
