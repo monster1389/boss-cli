@@ -36,7 +36,6 @@ python "<skill_dir>/scripts/collect_boss_resumes.py" --jd-text "<JD text>" --job
 ```bash
 boss help
 boss recommend <keyword>
-boss deep-search <keyword>
 boss resumes --from chat --limit 1 --json
 ```
 

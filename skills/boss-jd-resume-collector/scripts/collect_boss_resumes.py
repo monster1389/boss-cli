@@ -216,7 +216,6 @@ def run_preflight(boss_bin: str, job_keyword: str) -> dict[str, Any]:
     checks = [
         ("boss_help", boss_cmd(boss_bin, "help")),
         ("recommend_page", boss_cmd(boss_bin, "recommend", job_keyword)),
-        ("deep_search_page", boss_cmd(boss_bin, "deep-search", job_keyword)),
         ("chat_resume_probe", boss_cmd(boss_bin, "resumes", "--from", "chat", "--limit", "1", "--json")),
     ]
     results: list[dict[str, Any]] = []
