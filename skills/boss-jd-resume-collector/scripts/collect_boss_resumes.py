@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""根据一份 JD 从 BOSS chat/recommend 来源各采集 3 份可用简历。"""
+"""根据一份 JD 从 BOSS chat/recommend/search 来源各采集 3 份可用简历。"""
 
 from __future__ import annotations
 
@@ -16,8 +16,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_SOURCES = ("chat", "recommend")
-ALL_SOURCES = ("chat", "recommend", "search")
+DEFAULT_SOURCES = ("chat", "recommend", "search")
 USABLE_STATUSES = {"downloaded", "skipped_existing"}
 FAILURE_KINDS = {
     "boss_not_found",
@@ -103,97 +102,6 @@ def split_command(command: str) -> list[str]:
     return shlex.split(command, posix=(os.name != "nt"))
 
 
-def resolve_boss_bin(explicit_boss_bin: str | None) -> tuple[str | None, dict[str, Any]]:
-    attempts: list[dict[str, Any]] = []
-    candidates: list[tuple[str, str]] = []
-    if explicit_boss_bin:
-        candidates.append(("argument", explicit_boss_bin))
-    env_boss_bin = os.environ.get("BOSS_BIN", "").strip()
-    if env_boss_bin and env_boss_bin != explicit_boss_bin:
-        candidates.append(("environment", env_boss_bin))
-    manifest_path = default_skill_toolchain_manifest()
-    manifest_exists, manifest_error = safe_path_exists(manifest_path)
-    if manifest_exists:
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest_boss_bin = str(manifest.get("boss_bin") or "").strip()
-            if manifest_boss_bin:
-                candidates.append(("skill_toolchain_manifest", manifest_boss_bin))
-        except (OSError, json.JSONDecodeError) as exc:
-            attempts.append({
-                "source": "skill_toolchain_manifest",
-                "candidate": str(manifest_path),
-                "ok": False,
-                "error": str(exc),
-            })
-    elif manifest_error:
-        attempts.append({
-            "source": "skill_toolchain_manifest",
-            "candidate": str(manifest_path),
-            "ok": False,
-            "error": manifest_error,
-        })
-    managed_boss = default_managed_boss_cmd()
-    managed_exists, managed_error = safe_path_exists(managed_boss)
-    if managed_exists:
-        candidates.append(("skill_managed_bin", str(managed_boss)))
-    elif managed_error:
-        attempts.append({
-            "source": "skill_managed_bin",
-            "candidate": str(managed_boss),
-            "ok": False,
-            "error": managed_error,
-        })
-    path_boss = shutil.which("boss")
-    if path_boss:
-        candidates.append(("path", path_boss))
-    if os.name == "nt":
-        windows_cmd = default_windows_boss_cmd()
-        windows_exists, windows_error = safe_path_exists(windows_cmd)
-        if windows_exists:
-            candidates.append(("windows_npm_global", str(windows_cmd)))
-        elif windows_error:
-            attempts.append({
-                "source": "windows_npm_global",
-                "candidate": str(windows_cmd),
-                "ok": False,
-                "error": windows_error,
-            })
-
-    seen: set[str] = set()
-    for source, candidate in candidates:
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        try:
-            cmd = split_command(candidate)
-        except ValueError as exc:
-            attempts.append({"source": source, "candidate": candidate, "ok": False, "error": str(exc)})
-            continue
-        if not cmd:
-            attempts.append({"source": source, "candidate": candidate, "ok": False, "error": "empty command"})
-            continue
-        executable = cmd[0]
-        if any(sep in executable for sep in ("/", "\\")):
-            exists, exists_error = safe_path_exists(Path(executable))
-        else:
-            exists = shutil.which(executable) is not None
-            exists_error = None
-        attempts.append({"source": source, "candidate": candidate, "ok": exists})
-        if exists_error:
-            attempts[-1]["error"] = exists_error
-        if exists:
-            return candidate, {"ok": True, "selected": candidate, "selected_source": source, "attempts": attempts}
-
-    return None, {
-        "ok": False,
-        "selected": None,
-        "failure_kind": "boss_not_found",
-        "message": "未找到 boss 可执行命令。请设置 --boss-bin、BOSS_BIN，或把 boss.cmd 所在目录加入 PATH。",
-        "attempts": attempts,
-    }
-
-
 def run_command(cmd: list[str], timeout_seconds: int = 180) -> dict[str, Any]:
     try:
         completed = subprocess.run(
@@ -232,6 +140,126 @@ def run_command(cmd: list[str], timeout_seconds: int = 180) -> dict[str, Any]:
     }
 
 
+def boss_cmd(boss_bin: str, *args: str) -> list[str]:
+    return [*split_command(boss_bin), *args]
+
+
+def probe_boss_candidate(candidate: str) -> tuple[bool, str]:
+    result = run_command(boss_cmd(candidate, "help"), timeout_seconds=30)
+    combined = f"{result.get('stdout', '')}\n{result.get('stderr', '')}"
+    if not result["ok"]:
+        return False, combined.strip() or f"boss help exited with {result.get('exit_code')}"
+    if "resumes" not in combined:
+        return False, "boss help succeeded, but this executable does not expose the required resumes command"
+    return True, ""
+
+
+def resolve_boss_bin(explicit_boss_bin: str | None) -> tuple[str | None, dict[str, Any]]:
+    attempts: list[dict[str, Any]] = []
+    candidates: list[tuple[str, str]] = []
+    if explicit_boss_bin:
+        candidates.append(("argument", explicit_boss_bin))
+    env_boss_bin = os.environ.get("BOSS_BIN", "").strip()
+    if env_boss_bin and env_boss_bin != explicit_boss_bin:
+        candidates.append(("environment", env_boss_bin))
+    manifest_path = default_skill_toolchain_manifest()
+    manifest_exists, manifest_error = safe_path_exists(manifest_path)
+    if manifest_exists:
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest_boss_bin = str(manifest.get("boss_bin") or "").strip()
+            if manifest_boss_bin:
+                candidates.append(("skill_toolchain_manifest", manifest_boss_bin))
+        except (OSError, json.JSONDecodeError) as exc:
+            attempts.append({
+                "source": "skill_toolchain_manifest",
+                "candidate": str(manifest_path),
+                "ok": False,
+                "error": str(exc),
+            })
+    elif manifest_error:
+        attempts.append({
+            "source": "skill_toolchain_manifest",
+            "candidate": str(manifest_path),
+            "ok": False,
+            "error": manifest_error,
+        })
+
+    managed_boss = default_managed_boss_cmd()
+    managed_exists, managed_error = safe_path_exists(managed_boss)
+    if managed_exists:
+        candidates.append(("skill_managed_bin", str(managed_boss)))
+    elif managed_error:
+        attempts.append({
+            "source": "skill_managed_bin",
+            "candidate": str(managed_boss),
+            "ok": False,
+            "error": managed_error,
+        })
+
+    if os.name == "nt":
+        windows_cmd = default_windows_boss_cmd()
+        windows_exists, windows_error = safe_path_exists(windows_cmd)
+        if windows_exists:
+            candidates.append(("windows_npm_global", str(windows_cmd)))
+        elif windows_error:
+            attempts.append({
+                "source": "windows_npm_global",
+                "candidate": str(windows_cmd),
+                "ok": False,
+                "error": windows_error,
+            })
+
+    path_boss_cmd = shutil.which("boss.cmd")
+    if path_boss_cmd:
+        candidates.append(("path_cmd", path_boss_cmd))
+    path_boss = shutil.which("boss")
+    if path_boss:
+        candidates.append(("path", path_boss))
+
+    seen: set[str] = set()
+    for source, candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            cmd = split_command(candidate)
+        except ValueError as exc:
+            attempts.append({"source": source, "candidate": candidate, "ok": False, "error": str(exc)})
+            continue
+        if not cmd:
+            attempts.append({"source": source, "candidate": candidate, "ok": False, "error": "empty command"})
+            continue
+        executable = cmd[0]
+        if any(sep in executable for sep in ("/", "\\")):
+            exists, exists_error = safe_path_exists(Path(executable))
+        else:
+            exists = shutil.which(executable) is not None
+            exists_error = None
+        attempt: dict[str, Any] = {"source": source, "candidate": candidate, "ok": False, "exists": exists}
+        if exists_error:
+            attempt["error"] = exists_error
+        if not exists:
+            attempt.setdefault("error", "candidate does not exist or is not on PATH")
+            attempts.append(attempt)
+            continue
+        probe_ok, probe_error = probe_boss_candidate(candidate)
+        attempt["ok"] = probe_ok
+        if probe_error:
+            attempt["error"] = probe_error
+        attempts.append(attempt)
+        if probe_ok:
+            return candidate, {"ok": True, "selected": candidate, "selected_source": source, "attempts": attempts}
+
+    return None, {
+        "ok": False,
+        "selected": None,
+        "failure_kind": "boss_not_found",
+        "message": "未找到支持 resumes 命令的 boss 可执行命令。请设置 --boss-bin、BOSS_BIN，或重新运行 bootstrap_boss_cli。",
+        "attempts": attempts,
+    }
+
+
 def classify_failure(text: str, *, json_error: bool = False, usable_count: int | None = None) -> str | None:
     lowered = text.lower()
     if json_error:
@@ -251,11 +279,7 @@ def classify_failure(text: str, *, json_error: bool = False, usable_count: int |
     return None
 
 
-def boss_cmd(boss_bin: str, *args: str) -> list[str]:
-    return [*split_command(boss_bin), *args]
-
-
-def run_preflight(boss_bin: str, job_keyword: str) -> dict[str, Any]:
+def run_preflight(boss_bin: str, job_keyword: str, timeout_seconds: int) -> dict[str, Any]:
     checks = [
         ("boss_help", boss_cmd(boss_bin, "help")),
         ("recommend_page", boss_cmd(boss_bin, "recommend", job_keyword)),
@@ -263,7 +287,7 @@ def run_preflight(boss_bin: str, job_keyword: str) -> dict[str, Any]:
     ]
     results: list[dict[str, Any]] = []
     for name, cmd in checks:
-        result = run_command(cmd)
+        result = run_command(cmd, timeout_seconds=timeout_seconds)
         combined = f"{result.get('stdout', '')}\n{result.get('stderr', '')}"
         if not result["ok"]:
             result["failure_kind"] = result.get("failure_kind") or classify_failure(combined) or "unknown"
@@ -291,6 +315,7 @@ def run_boss_resumes(
     search_keyword: str | None = None,
     search_job: str | None = None,
     search_city: str | None = None,
+    timeout_seconds: int = 180,
 ) -> dict[str, Any]:
     cmd = boss_cmd(
         boss_bin,
@@ -318,7 +343,7 @@ def run_boss_resumes(
                 "counts": {},
                 "usable_count": 0,
                 "failure_kind": "insufficient_data",
-                "errors": ["搜索关键词不明确。启用 --include-search 时请传入 --search-keyword 或 --job-keyword。"],
+                "errors": ["搜索关键词不明确。请传入 --search-keyword 或 --job-keyword。"],
             }
         cmd.extend(["--keyword", search_keyword])
         if search_job:
@@ -326,7 +351,7 @@ def run_boss_resumes(
         if search_city:
             cmd.extend(["--city", search_city])
 
-    completed = run_command(cmd)
+    completed = run_command(cmd, timeout_seconds=timeout_seconds)
     if not completed["ok"]:
         combined = f"{completed.get('stdout', '')}\n{completed.get('stderr', '')}"
         return {
@@ -567,16 +592,12 @@ def main() -> int:
     parser.add_argument("--boss-bin")
     parser.add_argument("--resume-root", default=str(default_resume_root()))
     parser.add_argument("--runs-root", default=str(default_runs_root()))
-    parser.add_argument(
-        "--include-search",
-        action="store_true",
-        help="同时采集普通搜索页。默认只要求 chat/recommend。",
-    )
+    parser.add_argument("--command-timeout-seconds", type=int, default=900)
     parser.add_argument("--search-keyword", help="search 来源使用的必填关键词；默认使用 --job-keyword 或 JD 推断关键词。")
-    parser.add_argument("--search-job", help="search 来源可选岗位筛选；默认使用 --job-keyword 或 JD 推断关键词。")
+    parser.add_argument("--search-job", help="search 来源可选岗位筛选；只有显式传入时才启用。")
     parser.add_argument("--search-city", help="search 来源可选城市筛选。")
     args = parser.parse_args()
-    requested_sources = ALL_SOURCES if args.include_search else DEFAULT_SOURCES
+    requested_sources = DEFAULT_SOURCES
 
     jd_text, jd_source = read_jd(args)
     job_keyword = (args.job_keyword or "").strip() or infer_job_keyword(jd_text)
@@ -584,7 +605,7 @@ def main() -> int:
         raise SystemExit("岗位关键词不明确。请先传入 --job-keyword 后再采集简历。")
 
     search_keyword = (args.search_keyword or "").strip() or job_keyword
-    search_job = (args.search_job or "").strip() or job_keyword
+    search_job = (args.search_job or "").strip() or None
     search_city = (args.search_city or "").strip() or None
 
     created_at = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -607,7 +628,7 @@ def main() -> int:
         }
         sources = {source: empty_source_result(source, "boss_not_found", boss_info["message"]) for source in requested_sources}
     else:
-        preflight = run_preflight(boss_bin, job_keyword)
+        preflight = run_preflight(boss_bin, job_keyword, args.command_timeout_seconds)
         sources = {}
         if preflight["ok"]:
             for source in requested_sources:
@@ -619,6 +640,7 @@ def main() -> int:
                     search_keyword=search_keyword,
                     search_job=search_job,
                     search_city=search_city,
+                    timeout_seconds=args.command_timeout_seconds,
                 )
                 usable_count, errors, failure_kind = validate_source_result(result)
                 result["usable_count"] = usable_count
@@ -641,6 +663,7 @@ def main() -> int:
         sources=sources,
         requested_sources=requested_sources,
     )
+    manifest["command_timeout_seconds"] = args.command_timeout_seconds
     manifest_path, summary_path = write_outputs(run_dir, manifest)
 
     print(

@@ -54,7 +54,7 @@ powershell -ExecutionPolicy Bypass -File "$HOME\.codex\skills\boss-jd-resume-col
 3. 确认 BOSS 登录态：如未登录，先运行 `boss login` 并扫码。
 4. 运行采集脚本。
 
-无 Python 环境时使用 PowerShell：
+PowerShell 入口会转调用同目录 Python 采集脚本：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File "<skill_dir>\scripts\collect_boss_resumes.ps1" -JdFile "<jd.md>" -JobKeyword "<keyword>"
@@ -66,7 +66,7 @@ powershell -ExecutionPolicy Bypass -File "<skill_dir>\scripts\collect_boss_resum
 powershell -ExecutionPolicy Bypass -File "<skill_dir>\scripts\collect_boss_resumes.ps1" -JdFile "<jd.md>" -JobKeyword "<keyword>" -CommandTimeoutSeconds 900
 ```
 
-已有 Python 环境时也可以使用同等 Python 入口：
+也可以直接使用 Python 入口：
 
 ```bash
 python "<skill_dir>/scripts/collect_boss_resumes.py" --jd-file "<jd.md>" --job-keyword "<keyword>"
@@ -80,11 +80,12 @@ powershell -ExecutionPolicy Bypass -File "<skill_dir>\scripts\collect_boss_resum
 
 ## 默认采集来源
 
-默认只采集并校验：
+默认采集并校验：
 
 ```text
 boss resumes --from chat --limit 3 --json
 boss resumes --from recommend --limit 3 --json --job <keyword>
+boss resumes --from search --keyword <keyword> --limit 3 --json
 ```
 
 采集前自检只检查：
@@ -95,22 +96,21 @@ boss recommend <keyword>
 boss resumes --from chat --limit 1 --json
 ```
 
-`search` 不作为默认前置条件，也不参与默认成功门槛。只有用户明确要求普通搜索采集时才启用：
+如需收窄搜索页筛选，可以显式传入 search 专用参数：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "<skill_dir>\scripts\collect_boss_resumes.ps1" -JdFile "<jd.md>" -JobKeyword "<keyword>" -IncludeSearch -SearchKeyword "<keyword>" -SearchJob "<job>" -SearchCity "<city>"
+powershell -ExecutionPolicy Bypass -File "<skill_dir>\scripts\collect_boss_resumes.ps1" -JdFile "<jd.md>" -JobKeyword "<keyword>" -SearchKeyword "<keyword>" -SearchCity "<city>"
 ```
 
-启用后会额外执行：
+只有显式传入 `-SearchJob` / `--search-job` 时，search 命令才会追加 `--job`：
 
 ```text
-boss resumes --from search --keyword <keyword> --job <job> --city <city> --limit 3 --json
+boss resumes --from search --keyword <keyword> --job <job> --limit 3 --json
 ```
 
 ## 成功标准
 
-- 默认模式下，`chat` 和 `recommend` 每个来源都必须有 3 份可用简历。
-- 启用 `IncludeSearch` 时，`search` 也必须有 3 份可用简历。
+- 默认模式下，`chat`、`recommend`、`search` 每个来源都必须有 3 份可用简历。
 - 可用状态只包括 `downloaded` 和 `skipped_existing`。
 - 每条可用结果都必须能找到本地 `resume.md` 和 `resume.json`。
 - 任一请求来源不足 3 份时，本轮采集失败；但仍会报告失败来源、失败分类、候选人级错误，以及已经落地的可用简历总数。
@@ -141,5 +141,5 @@ boss resumes --from search --keyword <keyword> --job <job> --city <city> --limit
 
 - 不给候选人发消息。
 - 不修改职位状态。
-- 默认不触发 search 来源采集。
+- 默认触发 search 来源采集。
 - 下载的简历属于敏感招聘数据，按私密数据处理。
