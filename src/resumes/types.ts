@@ -1,4 +1,4 @@
-export type ResumeSource = 'chat' | 'recommend' | 'deep-search';
+export type ResumeSource = 'chat' | 'recommend' | 'search';
 
 export type ResumeSyncStatus =
   | 'downloaded'

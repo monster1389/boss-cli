@@ -13,7 +13,6 @@ import {
   waitForVisibleCResumeIframeReady,
 } from '../common/c_resume_capture.js';
 import { ensureChatIndexAllFilter, readCandidateListItems } from '../toolset/list.js';
-import { runDeepSearchMatchOnPage, type DeepSearchRunContext } from '../toolset/deep-search.js';
 import {
   ensureInRecommendPage,
   openRecommendResumePreviewByCandidate,
@@ -91,11 +90,11 @@ type ResumeSyncStructuredOutput = {
 };
 
 type ResumeSyncSearchContext = {
+  keyword: string;
   requestedJobKeyword: string;
+  requestedCity: string;
   selectedJob: string;
-  coreRequirements: string[];
-  bonusRequirements: string[];
-  remainingCountText: string;
+  selectedCity: string;
   resultUrl: string;
   candidateCount: number;
 };
@@ -104,6 +103,46 @@ const AUTH_OR_RISK_PATTERN =
   /(?:\blogin\b|forbidden|captcha|risk|\u767b\u5f55|\u626b\u7801|\u9a8c\u8bc1\u7801|\u98ce\u63a7|\u8d26\u53f7)/i;
 
 const BOSS_CHAT_SEARCH_URL = 'https://www.zhipin.com/web/chat/search';
+const SEARCH_CITY_PROVINCE: Record<string, string> = {
+  广州: '广东',
+  深圳: '广东',
+  东莞: '广东',
+  佛山: '广东',
+  珠海: '广东',
+  惠州: '广东',
+  中山: '广东',
+  杭州: '浙江',
+  宁波: '浙江',
+  南京: '江苏',
+  苏州: '江苏',
+  成都: '四川',
+  武汉: '湖北',
+  长沙: '湖南',
+  西安: '陕西',
+  郑州: '河南',
+  济南: '山东',
+  青岛: '山东',
+  厦门: '福建',
+  福州: '福建',
+  合肥: '安徽',
+  南昌: '江西',
+  昆明: '云南',
+  南宁: '广西',
+  海口: '海南',
+  贵阳: '贵州',
+  沈阳: '辽宁',
+  大连: '辽宁',
+  长春: '吉林',
+  哈尔滨: '黑龙江',
+  太原: '山西',
+  石家庄: '河北',
+  呼和浩特: '内蒙古',
+  兰州: '甘肃',
+  银川: '宁夏',
+  西宁: '青海',
+  乌鲁木齐: '新疆',
+  拉萨: '西藏',
+};
 
 const CANVAS_TEXT_CAPTURE_SCRIPT = `(() => {
   if (window.__bossCliResumeCanvasCaptureInstalled) return;
@@ -228,14 +267,14 @@ async function assertLoggedIn(page: Page): Promise<void> {
   }
 }
 
-async function ensureDeepSearchRoute(page: Page): Promise<void> {
+async function ensureSearchRoute(page: Page): Promise<void> {
   if (!isBossChatSearchUrl(page.url())) {
     await page.goto(BOSS_CHAT_SEARCH_URL, {
       waitUntil: 'load',
       timeout: 60_000,
     });
   }
-  await ensureSearchFrameReady(page);
+  await getSearchFrame(page);
 }
 
 function isBossChatSearchUrl(url: string): boolean {
@@ -288,13 +327,275 @@ async function ensureSearchFrameReady(page: Page): Promise<Frame> {
   return frame;
 }
 
-async function readSearchSelectedJobLabel(page: Page): Promise<string> {
-  return (await page.evaluate(`(() => {
+async function ensureSearchControlsReady(frame: Frame): Promise<void> {
+  await frame.waitForFunction(
+    `(() => {
+      const input = document.querySelector(".search-input-wrap input");
+      const button = document.querySelector(".search-input-wrap > i");
+      return input instanceof HTMLInputElement && button instanceof HTMLElement;
+    })()`,
+    { timeout: 20_000 },
+  );
+}
+
+async function readSearchSelectedJobDropdownLabel(frame: Frame): Promise<string> {
+  return (await frame.evaluate(`(() => {
     const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
-    const menu = norm(document.querySelector(".menu-geeksearch .menu-item-content")?.textContent);
-    const label = menu.replace(/^搜索\\s*/, "").trim();
-    return label || "搜索";
+    const label = norm(document.querySelector(".search-job-list-C .ui-dropmenu-label")?.textContent);
+    return label || "unknown-job";
   })()`)) as string;
+}
+
+async function readSearchSelectedCity(frame: Frame): Promise<string> {
+  return (await frame.evaluate(`(() => {
+    const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
+    const label = norm(document.querySelector(".search-job-list-C")?.textContent || document.querySelector(".city-wrap")?.textContent);
+    return label || "";
+  })()`)) as string;
+}
+
+async function isSearchCitySelected(frame: Frame, city: string): Promise<boolean> {
+  return (await frame.evaluate(`(() => {
+    const city = ${JSON.stringify(city)};
+    const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
+    const text = norm(document.querySelector(".search-job-list-C")?.textContent);
+    return !!city && text.includes(city);
+  })()`)) as boolean;
+}
+
+async function selectSearchJob(frame: Frame, keyword: string): Promise<string> {
+  const kw = keyword.trim();
+  if (!kw) {
+    throw new Error('resumes --from search 的 --job 不能为空。');
+  }
+  const clicked = (await frame.evaluate(`(() => {
+    const label = document.querySelector(".search-job-list-C .ui-dropmenu-label");
+    if (!(label instanceof HTMLElement)) return false;
+    label.click();
+    return true;
+  })()`)) as boolean;
+  if (!clicked) {
+    throw new Error(`搜索页未找到岗位下拉控件，无法选择岗位：${kw}`);
+  }
+  await sleepRandom(180, 320);
+
+  await frame.evaluate(`(() => {
+    const keyword = ${JSON.stringify(kw)};
+    const candidates = Array.from(document.querySelectorAll("input"));
+    const input = candidates.find((item) => {
+      const rect = item.getBoundingClientRect();
+      const style = window.getComputedStyle(item);
+      return rect.width > 20 && rect.height > 10 && style.display !== "none" && style.visibility !== "hidden";
+    });
+    if (!(input instanceof HTMLInputElement)) return false;
+    input.focus();
+    input.value = keyword;
+    input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: keyword }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  })()`);
+  await sleepRandom(500, 800);
+
+  const selected = (await frame.evaluate(`(() => {
+    const keyword = ${JSON.stringify(kw)};
+    const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
+    const isVisible = (el) => {
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+    };
+    const selectors = [
+      ".ui-dropmenu-list li",
+      ".ui-dropmenu-list .ui-dropmenu-item",
+      ".job-dropmenu-list li",
+      ".job-dropmenu-item",
+      ".job-list .job-item",
+      ".job-item",
+      "[class*='drop'] li",
+      "[class*='popover'] li"
+    ];
+    const items = Array.from(document.querySelectorAll(selectors.join(",")))
+      .filter((el) => el instanceof HTMLElement && isVisible(el));
+    const target = items.find((el) => norm(el.textContent).includes(keyword));
+    if (!(target instanceof HTMLElement)) return "";
+    const text = norm(target.textContent);
+    target.scrollIntoView({ block: "center", inline: "nearest" });
+    target.click();
+    return text;
+  })()`)) as string;
+  if (!selected) {
+    throw new Error(`搜索页岗位下拉中未找到匹配岗位：${kw}`);
+  }
+  await sleepRandom(400, 700);
+  return readSearchSelectedJobDropdownLabel(frame);
+}
+
+async function selectSearchCity(frame: Frame, city: string): Promise<string> {
+  const targetCity = city.trim();
+  if (!targetCity) {
+    throw new Error('resumes --from search 的 --city 不能为空。');
+  }
+  if (await isSearchCitySelected(frame, targetCity)) {
+    return targetCity;
+  }
+  const cityHandle = await frame.$('.city-wrap');
+  if (!cityHandle) {
+    throw new Error(`搜索页未找到城市选择控件，无法选择城市：${targetCity}`);
+  }
+  await cityHandle.click();
+  await cityHandle.dispose();
+  await sleepRandom(300, 520);
+  const province = SEARCH_CITY_PROVINCE[targetCity];
+  if (province) {
+    const provinceClicked = (await frame.evaluate(`(() => {
+      const province = ${JSON.stringify(province)};
+      const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
+      const isVisible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+      };
+      const items = Array.from(document.querySelectorAll(".city-select-panel *, .city-list *, .city-panel *, .city-picker *, [class*='city'] *"))
+        .filter((el) => el instanceof HTMLElement && isVisible(el))
+        .filter((el) => norm(el.textContent) === province);
+      const target = items[0];
+      if (!(target instanceof HTMLElement)) return false;
+      target.scrollIntoView({ block: "center", inline: "nearest" });
+      target.click();
+      return true;
+    })()`)) as boolean;
+    if (provinceClicked) {
+      await sleepRandom(300, 520);
+    }
+  }
+
+  const result = (await frame.evaluate(`(() => {
+    const city = ${JSON.stringify(targetCity)};
+    const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
+    const isVisible = (el) => {
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+    };
+    const selectors = [
+      ".city-select-panel li",
+      ".city-select-panel a",
+      ".city-select-panel span",
+      ".city-select-panel dd",
+      ".city-select-panel p",
+      ".city-list li",
+      ".city-list a",
+      ".city-list span",
+      ".city-list dd",
+      ".city-list p",
+      ".city-panel li",
+      ".city-panel a",
+      ".city-panel span",
+      ".city-panel dd",
+      ".city-panel p",
+      ".city-picker li",
+      ".city-picker a",
+      ".city-picker span",
+      ".city-picker dd",
+      ".city-picker p",
+      ".ui-dropmenu-list li",
+      ".ui-dropmenu-list a",
+      ".ui-dropmenu-list span",
+      "[class*='city'] li",
+      "[class*='city'] a",
+      "[class*='city'] span",
+      "[class*='city'] dd",
+      "[class*='city'] p",
+      "[class*='popover'] li",
+      "[class*='popover'] a",
+      "[class*='popover'] span",
+      "[class*='popover'] dd",
+      "[class*='popover'] p"
+    ];
+    const items = Array.from(document.querySelectorAll(selectors.join(",")))
+      .filter((el) => el instanceof HTMLElement && isVisible(el))
+      .filter((el) => {
+        const text = norm(el.textContent);
+        return text && text.length <= 20;
+      });
+    const target = items.find((el) => norm(el.textContent) === city) || items.find((el) => {
+      const text = norm(el.textContent);
+      return text.includes(city);
+    });
+    const visibleTexts = Array.from(new Set(items.map((el) => norm(el.textContent)).filter(Boolean))).slice(0, 40);
+    if (!(target instanceof HTMLElement)) return { selected: "", visibleTexts };
+    const text = norm(target.textContent);
+    target.scrollIntoView({ block: "center", inline: "nearest" });
+    target.click();
+    return { selected: text, visibleTexts };
+  })()`)) as { selected: string; visibleTexts: string[] };
+  if (!result.selected) {
+    if (await isSearchCitySelected(frame, targetCity)) {
+      return targetCity;
+    }
+    const candidates = result.visibleTexts.length > 0 ? result.visibleTexts.join(' / ') : '无可见城市候选';
+    throw new Error(`搜索页城市选择中未找到匹配城市：${targetCity}；可见候选：${candidates}`);
+  }
+  await sleepRandom(400, 700);
+  return readSearchSelectedCity(frame);
+}
+
+async function submitSearchKeyword(frame: Frame, keyword: string): Promise<void> {
+  const kw = keyword.trim();
+  if (!kw) {
+    throw new Error('resumes --from search 必须指定非空 --keyword。');
+  }
+  const submitted = (await frame.evaluate(`(() => {
+    const keyword = ${JSON.stringify(kw)};
+    const input = document.querySelector(".search-input-wrap input");
+    const button = document.querySelector(".search-input-wrap > i");
+    if (!(input instanceof HTMLInputElement) || !(button instanceof HTMLElement)) return false;
+    input.focus();
+    input.value = keyword;
+    input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: keyword }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    button.click();
+    return true;
+  })()`)) as boolean;
+  if (!submitted) {
+    throw new Error(`搜索页未找到关键词输入框或搜索按钮，无法搜索：${kw}`);
+  }
+}
+
+async function runSearchPageQuery(page: Page, options: ResumeSyncCliOptions): Promise<ResumeSyncSearchContext> {
+  if (!options.keyword) {
+    throw new Error('resumes --from search 必须指定 --keyword。');
+  }
+  await ensureSearchRoute(page);
+  const searchFrame = await getSearchFrame(page);
+  await ensureSearchControlsReady(searchFrame);
+
+  const selectedJob = options.jobKeyword
+    ? await selectSearchJob(searchFrame, options.jobKeyword)
+    : await readSearchSelectedJobDropdownLabel(searchFrame);
+  const selectedCity = options.city
+    ? await selectSearchCity(searchFrame, options.city)
+    : await readSearchSelectedCity(searchFrame);
+  await submitSearchKeyword(searchFrame, options.keyword);
+
+  const frame = await ensureSearchFrameReady(page).catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new ResumeSyncAbortError(`搜索已触发，但结果页未加载候选人卡片（关键词：${options.keyword}）：${message}`);
+  });
+  const candidates = await readSearchCandidateList(frame);
+  if (candidates.length === 0) {
+    throw new ResumeSyncAbortError(`搜索已触发，但结果页没有候选人卡片（关键词：${options.keyword}）。`);
+  }
+
+  return {
+    keyword: options.keyword,
+    requestedJobKeyword: options.jobKeyword ?? '',
+    requestedCity: options.city ?? '',
+    selectedJob,
+    selectedCity,
+    resultUrl: searchFrame.url(),
+    candidateCount: candidates.length,
+  };
 }
 
 async function readSearchCandidateList(frame: Frame): Promise<SourceCandidate[]> {
@@ -312,7 +613,7 @@ async function readSearchCandidateList(frame: Frame): Promise<SourceCandidate[]>
       const meta = norm(anchor.querySelector(".geek-info-detail, .card-container")?.textContent || "");
       const buttonText = norm(anchor.querySelector("button, .btn")?.textContent || "");
       return {
-        source: "deep-search",
+        source: "search",
         name,
         jobLabel: "搜索",
         sourceMeta: {
@@ -947,13 +1248,10 @@ export async function collectSourceCandidates(
     }));
   }
 
-  if (source === 'deep-search') {
-    await ensureDeepSearchRoute(page);
-    if (options.jobKeyword) {
-      throw new Error('当前 BOSS 搜索页（/web/chat/search）暂不支持通过 --job 切换岗位，请先在页面选择岗位后再运行。');
-    }
+  if (source === 'search') {
+    const context = await runSearchPageQuery(page, options);
     const frame = await ensureSearchFrameReady(page);
-    const selectedJob = await readSearchSelectedJobLabel(page);
+    const selectedJob = context.selectedJob;
     const candidates = await readSearchCandidateList(frame);
     return candidates.slice(0, options.limit).map((candidate) => ({
       source,
@@ -964,6 +1262,12 @@ export async function collectSourceCandidates(
         meta: candidate.sourceMeta.meta ?? null,
         buttonText: candidate.sourceMeta.buttonText ?? null,
         ka: candidate.sourceMeta.ka ?? null,
+        searchKeyword: context.keyword,
+        searchRequestedJob: context.requestedJobKeyword,
+        searchSelectedJob: context.selectedJob,
+        searchRequestedCity: context.requestedCity,
+        searchSelectedCity: context.selectedCity,
+        searchResultUrl: context.resultUrl,
       }),
     }));
   }
@@ -989,49 +1293,29 @@ type SourceCandidateCollection = {
   searchContext?: ResumeSyncSearchContext;
 };
 
-function toResumeSearchContext(context: DeepSearchRunContext, candidateCount: number): ResumeSyncSearchContext {
-  return {
-    requestedJobKeyword: context.requestedJobKeyword,
-    selectedJob: context.selectedJob,
-    coreRequirements: context.coreRequirements,
-    bonusRequirements: context.bonusRequirements,
-    remainingCountText: context.remainingCountText,
-    resultUrl: context.resultUrl,
-    candidateCount,
-  };
-}
-
 async function collectSourceCandidatesWithContext(
   page: Page,
   source: ResumeSource,
   options: ResumeSyncCliOptions,
 ): Promise<SourceCandidateCollection> {
-  if (source !== 'deep-search' || !options.search) {
+  if (source !== 'search') {
     return {
       candidates: await collectSourceCandidates(page, source, options),
     };
   }
-  if (!options.jobKeyword) {
-    throw new Error('resumes --from deep-search --search 必须指定 --job。');
-  }
-
-  const runContext = await runDeepSearchMatchOnPage(page, {
-    jobKeyword: options.jobKeyword,
-    coreRequirements: options.coreRequirements,
-    bonusRequirements: options.bonusRequirements,
-  });
+  const runContext = await runSearchPageQuery(page, options);
   const frame = await ensureSearchFrameReady(page).catch((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
-    throw new ResumeSyncAbortError(`深度搜索已触发，但结果页未加载候选人卡片（岗位：${runContext.selectedJob || options.jobKeyword}）：${message}`);
+    throw new ResumeSyncAbortError(`搜索已触发，但结果页未加载候选人卡片（关键词：${runContext.keyword}）：${message}`);
   });
-  const selectedJob = await readSearchSelectedJobLabel(page);
+  const selectedJob = runContext.selectedJob;
   const candidates = await readSearchCandidateList(frame);
   if (candidates.length === 0) {
-    throw new ResumeSyncAbortError(`深度搜索已触发，但结果页没有候选人卡片（岗位：${runContext.selectedJob || options.jobKeyword}）。`);
+    throw new ResumeSyncAbortError(`搜索已触发，但结果页没有候选人卡片（关键词：${runContext.keyword}）。`);
   }
 
   return {
-    searchContext: toResumeSearchContext(runContext, candidates.length),
+    searchContext: runContext,
     candidates: candidates.slice(0, options.limit).map((candidate) => ({
       source,
       name: candidate.name,
@@ -1041,8 +1325,11 @@ async function collectSourceCandidatesWithContext(
         meta: candidate.sourceMeta.meta ?? null,
         buttonText: candidate.sourceMeta.buttonText ?? null,
         ka: candidate.sourceMeta.ka ?? null,
+        searchKeyword: runContext.keyword,
         searchRequestedJob: runContext.requestedJobKeyword,
         searchSelectedJob: runContext.selectedJob,
+        searchRequestedCity: runContext.requestedCity,
+        searchSelectedCity: runContext.selectedCity,
         searchResultUrl: runContext.resultUrl,
       }),
     })),
@@ -1059,8 +1346,8 @@ async function openSourceCandidateResume(page: Page, candidate: SourceCandidate)
     });
   }
 
-  if (candidate.source === 'deep-search') {
-    await ensureDeepSearchRoute(page);
+  if (candidate.source === 'search') {
+    await ensureSearchRoute(page);
     const frame = await ensureSearchFrameReady(page);
     return openSearchResumePreviewByCandidate(frame, {
       name: candidate.name,
