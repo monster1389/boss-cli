@@ -6,7 +6,6 @@ param(
   [string]$ResumeRoot = "$HOME\.boss-cli\resumes",
   [string]$RunsRoot = "$HOME\.boss-cli\runs",
   [int]$CommandTimeoutSeconds = 900,
-  [switch]$IncludeSearch,
   [string]$SearchKeyword = "",
   [string]$SearchJob = "",
   [string]$SearchCity = ""
@@ -16,8 +15,7 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $UsableStatuses = @("downloaded", "skipped_existing")
-$RequestedSources = @("chat", "recommend")
-if ($IncludeSearch) { $RequestedSources = @("chat", "recommend", "search") }
+$RequestedSources = @("chat", "recommend", "search")
 
 function Get-SafeSegment([string]$Value) {
   $cleaned = $Value -replace '[<>:"/\\|?*\x00-\x1f]', "_" -replace '\s+', "_"
@@ -189,7 +187,7 @@ function Run-BossResumes([string]$Boss, [string]$Source, [string]$Root, [string]
   $resumeArgs = @("resumes", "--from", $Source, "--limit", "3", "--root", $Root, "--json")
   if ($Source -eq "recommend" -and $Keyword) { $resumeArgs += @("--job", $Keyword) }
   if ($Source -eq "search") {
-    if (-not $SearchKw) { throw "Search keyword is unclear. Pass -SearchKeyword or -JobKeyword before using -IncludeSearch." }
+    if (-not $SearchKw) { throw "Search keyword is unclear. Pass -SearchKeyword or -JobKeyword before collecting search resumes." }
     $resumeArgs += @("--keyword", $SearchKw)
     if ($SearchJobKeyword) { $resumeArgs += @("--job", $SearchJobKeyword) }
     if ($SearchCityName) { $resumeArgs += @("--city", $SearchCityName) }

@@ -16,8 +16,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_SOURCES = ("chat", "recommend")
-ALL_SOURCES = ("chat", "recommend", "search")
+DEFAULT_SOURCES = ("chat", "recommend", "search")
 USABLE_STATUSES = {"downloaded", "skipped_existing"}
 FAILURE_KINDS = {
     "boss_not_found",
@@ -318,7 +317,7 @@ def run_boss_resumes(
                 "counts": {},
                 "usable_count": 0,
                 "failure_kind": "insufficient_data",
-                "errors": ["搜索关键词不明确。启用 --include-search 时请传入 --search-keyword 或 --job-keyword。"],
+                "errors": ["搜索关键词不明确。请传入 --search-keyword 或 --job-keyword。"],
             }
         cmd.extend(["--keyword", search_keyword])
         if search_job:
@@ -567,16 +566,11 @@ def main() -> int:
     parser.add_argument("--boss-bin")
     parser.add_argument("--resume-root", default=str(default_resume_root()))
     parser.add_argument("--runs-root", default=str(default_runs_root()))
-    parser.add_argument(
-        "--include-search",
-        action="store_true",
-        help="同时采集普通搜索页。默认只要求 chat/recommend。",
-    )
     parser.add_argument("--search-keyword", help="search 来源使用的必填关键词；默认使用 --job-keyword 或 JD 推断关键词。")
     parser.add_argument("--search-job", help="search 来源可选岗位筛选；默认使用 --job-keyword 或 JD 推断关键词。")
     parser.add_argument("--search-city", help="search 来源可选城市筛选。")
     args = parser.parse_args()
-    requested_sources = ALL_SOURCES if args.include_search else DEFAULT_SOURCES
+    requested_sources = DEFAULT_SOURCES
 
     jd_text, jd_source = read_jd(args)
     job_keyword = (args.job_keyword or "").strip() or infer_job_keyword(jd_text)

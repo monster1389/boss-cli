@@ -95,13 +95,13 @@ boss recommend <keyword>
 boss resumes --from chat --limit 1 --json
 ```
 
-`search` 不作为默认前置条件，也不参与默认成功门槛。只有用户明确要求普通搜索采集时才启用：
+`search` 是默认前置来源之一，会和 `chat`、`recommend` 一起采集：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "<skill_dir>\scripts\collect_boss_resumes.ps1" -JdFile "<jd.md>" -JobKeyword "<keyword>" -IncludeSearch -SearchKeyword "<keyword>" -SearchJob "<job>" -SearchCity "<city>"
+powershell -ExecutionPolicy Bypass -File "<skill_dir>\scripts\collect_boss_resumes.ps1" -JdFile "<jd.md>" -JobKeyword "<keyword>" -SearchKeyword "<keyword>" -SearchJob "<job>" -SearchCity "<city>"
 ```
 
-启用后会额外执行：
+默认会额外执行：
 
 ```text
 boss resumes --from search --keyword <keyword> --job <job> --city <city> --limit 3 --json
@@ -109,8 +109,7 @@ boss resumes --from search --keyword <keyword> --job <job> --city <city> --limit
 
 ## 成功标准
 
-- 默认模式下，`chat` 和 `recommend` 每个来源都必须有 3 份可用简历。
-- 启用 `IncludeSearch` 时，`search` 也必须有 3 份可用简历。
+- 默认模式下，`chat`、`recommend`、`search` 每个来源都必须有 3 份可用简历。
 - 可用状态只包括 `downloaded` 和 `skipped_existing`。
 - 每条可用结果都必须能找到本地 `resume.md` 和 `resume.json`。
 - 任一请求来源不足 3 份时，本轮采集失败；但仍会报告失败来源、失败分类、候选人级错误，以及已经落地的可用简历总数。
@@ -141,5 +140,5 @@ boss resumes --from search --keyword <keyword> --job <job> --city <city> --limit
 
 - 不给候选人发消息。
 - 不修改职位状态。
-- 默认不触发 search 来源采集。
+- 默认触发 search 来源采集。
 - 下载的简历属于敏感招聘数据，按私密数据处理。
