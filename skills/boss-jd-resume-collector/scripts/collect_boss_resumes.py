@@ -17,7 +17,7 @@ from typing import Any
 
 
 DEFAULT_SOURCES = ("chat", "recommend")
-ALL_SOURCES = ("chat", "recommend", "deep-search")
+ALL_SOURCES = ("chat", "recommend", "search")
 USABLE_STATUSES = {"downloaded", "skipped_existing"}
 FAILURE_KINDS = {
     "boss_not_found",
@@ -288,6 +288,9 @@ def run_boss_resumes(
     source: str,
     root: Path,
     job_keyword: str | None,
+    search_keyword: str | None = None,
+    search_job: str | None = None,
+    search_city: str | None = None,
 ) -> dict[str, Any]:
     cmd = boss_cmd(
         boss_bin,
@@ -302,8 +305,26 @@ def run_boss_resumes(
     )
     if source == "recommend" and job_keyword:
         cmd.extend(["--job", job_keyword])
-    if source == "deep-search" and job_keyword:
-        cmd.extend(["--job", job_keyword, "--search"])
+    if source == "search":
+        if not search_keyword:
+            return {
+                "ok": False,
+                "source": source,
+                "command": cmd,
+                "exit_code": None,
+                "stdout": "",
+                "stderr": "",
+                "results": [],
+                "counts": {},
+                "usable_count": 0,
+                "failure_kind": "insufficient_data",
+                "errors": ["搜索关键词不明确。启用 --include-search 时请传入 --search-keyword 或 --job-keyword。"],
+            }
+        cmd.extend(["--keyword", search_keyword])
+        if search_job:
+            cmd.extend(["--job", search_job])
+        if search_city:
+            cmd.extend(["--city", search_city])
 
     completed = run_command(cmd)
     if not completed["ok"]:
@@ -547,17 +568,24 @@ def main() -> int:
     parser.add_argument("--resume-root", default=str(default_resume_root()))
     parser.add_argument("--runs-root", default=str(default_runs_root()))
     parser.add_argument(
-        "--include-deep-search",
+        "--include-search",
         action="store_true",
-        help="同时采集 deep-search。默认只要求 chat/recommend，避免深搜页不可用阻断整轮。",
+        help="同时采集普通搜索页。默认只要求 chat/recommend。",
     )
+    parser.add_argument("--search-keyword", help="search 来源使用的必填关键词；默认使用 --job-keyword 或 JD 推断关键词。")
+    parser.add_argument("--search-job", help="search 来源可选岗位筛选；默认使用 --job-keyword 或 JD 推断关键词。")
+    parser.add_argument("--search-city", help="search 来源可选城市筛选。")
     args = parser.parse_args()
-    requested_sources = ALL_SOURCES if args.include_deep_search else DEFAULT_SOURCES
+    requested_sources = ALL_SOURCES if args.include_search else DEFAULT_SOURCES
 
     jd_text, jd_source = read_jd(args)
     job_keyword = (args.job_keyword or "").strip() or infer_job_keyword(jd_text)
     if not job_keyword:
         raise SystemExit("岗位关键词不明确。请先传入 --job-keyword 后再采集简历。")
+
+    search_keyword = (args.search_keyword or "").strip() or job_keyword
+    search_job = (args.search_job or "").strip() or job_keyword
+    search_city = (args.search_city or "").strip() or None
 
     created_at = datetime.now().strftime("%Y%m%d_%H%M%S")
     runs_root = Path(args.runs_root).expanduser()
@@ -583,7 +611,15 @@ def main() -> int:
         sources = {}
         if preflight["ok"]:
             for source in requested_sources:
-                result = run_boss_resumes(boss_bin, source, resume_root, job_keyword)
+                result = run_boss_resumes(
+                    boss_bin,
+                    source,
+                    resume_root,
+                    job_keyword,
+                    search_keyword=search_keyword,
+                    search_job=search_job,
+                    search_city=search_city,
+                )
                 usable_count, errors, failure_kind = validate_source_result(result)
                 result["usable_count"] = usable_count
                 result["errors"] = errors

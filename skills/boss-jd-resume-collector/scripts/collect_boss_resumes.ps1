@@ -6,7 +6,10 @@ param(
   [string]$ResumeRoot = "$HOME\.boss-cli\resumes",
   [string]$RunsRoot = "$HOME\.boss-cli\runs",
   [int]$CommandTimeoutSeconds = 900,
-  [switch]$IncludeDeepSearch
+  [switch]$IncludeSearch,
+  [string]$SearchKeyword = "",
+  [string]$SearchJob = "",
+  [string]$SearchCity = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,7 +17,7 @@ Set-StrictMode -Version Latest
 
 $UsableStatuses = @("downloaded", "skipped_existing")
 $RequestedSources = @("chat", "recommend")
-if ($IncludeDeepSearch) { $RequestedSources = @("chat", "recommend", "deep-search") }
+if ($IncludeSearch) { $RequestedSources = @("chat", "recommend", "search") }
 
 function Get-SafeSegment([string]$Value) {
   $cleaned = $Value -replace '[<>:"/\\|?*\x00-\x1f]', "_" -replace '\s+', "_"
@@ -182,10 +185,15 @@ function Run-Preflight([string]$Boss, [string]$Keyword, [int]$TimeoutSeconds) {
   }
 }
 
-function Run-BossResumes([string]$Boss, [string]$Source, [string]$Root, [string]$Keyword, [int]$TimeoutSeconds) {
+function Run-BossResumes([string]$Boss, [string]$Source, [string]$Root, [string]$Keyword, [string]$SearchKw, [string]$SearchJobKeyword, [string]$SearchCityName, [int]$TimeoutSeconds) {
   $resumeArgs = @("resumes", "--from", $Source, "--limit", "3", "--root", $Root, "--json")
   if ($Source -eq "recommend" -and $Keyword) { $resumeArgs += @("--job", $Keyword) }
-  if ($Source -eq "deep-search" -and $Keyword) { $resumeArgs += @("--job", $Keyword, "--search") }
+  if ($Source -eq "search") {
+    if (-not $SearchKw) { throw "Search keyword is unclear. Pass -SearchKeyword or -JobKeyword before using -IncludeSearch." }
+    $resumeArgs += @("--keyword", $SearchKw)
+    if ($SearchJobKeyword) { $resumeArgs += @("--job", $SearchJobKeyword) }
+    if ($SearchCityName) { $resumeArgs += @("--city", $SearchCityName) }
+  }
   $completed = Run-CommandJson $Boss $resumeArgs $TimeoutSeconds
   if (-not $completed.ok) {
     $combined = "$($completed.stdout)`n$($completed.stderr)"
@@ -254,6 +262,11 @@ $jd = Read-Jd
 $keyword = $JobKeyword.Trim()
 if (-not $keyword) { $keyword = Infer-JobKeyword $jd.text }
 if (-not $keyword) { throw "Job keyword is unclear. Pass -JobKeyword before collecting resumes." }
+$effectiveSearchKeyword = $SearchKeyword.Trim()
+if (-not $effectiveSearchKeyword) { $effectiveSearchKeyword = $keyword }
+$effectiveSearchJob = $SearchJob.Trim()
+if (-not $effectiveSearchJob) { $effectiveSearchJob = $keyword }
+$effectiveSearchCity = $SearchCity.Trim()
 
 $createdAt = Get-Date -Format "yyyyMMdd_HHmmss"
 $runDir = Join-Path $RunsRoot "$createdAt`_$(Get-SafeSegment $keyword)"
@@ -272,7 +285,7 @@ if (-not $bossInfo.ok) {
   $preflight = Run-Preflight $bossInfo.selected $keyword $CommandTimeoutSeconds
   if ($preflight.ok) {
     foreach ($source in $RequestedSources) {
-      $result = Run-BossResumes $bossInfo.selected $source $ResumeRoot $keyword $CommandTimeoutSeconds
+      $result = Run-BossResumes $bossInfo.selected $source $ResumeRoot $keyword $effectiveSearchKeyword $effectiveSearchJob $effectiveSearchCity $CommandTimeoutSeconds
       $validated = Validate-Source $result
       $result["usable_count"] = $validated["usable_count"]
       $result["errors"] = $validated["errors"]
