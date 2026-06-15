@@ -94,10 +94,110 @@ type ResumeSyncSearchContext = {
   requestedJobKeyword: string;
   requestedCity: string;
   selectedJob: string;
+  jobMatchMethod: string;
+  jobCandidateSample: string[];
   selectedCity: string;
   resultUrl: string;
   candidateCount: number;
 };
+
+export type SearchJobMatchMethod = 'exact' | 'contains' | 'all_terms';
+
+export type SearchJobMatchCandidate = {
+  raw: string;
+  normalized: string;
+  matchMethod: SearchJobMatchMethod;
+};
+
+export function normalizeSearchJobText(value: string): string {
+  return value
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\u200b-\u200f\u202a-\u202e\ufeff]/g, '')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+export function matchSearchJobCandidate(keyword: string, rawCandidate: string): SearchJobMatchCandidate | null {
+  const normalizedKeyword = normalizeSearchJobText(keyword);
+  const normalized = normalizeSearchJobText(rawCandidate);
+  if (!normalizedKeyword || !normalized) {
+    return null;
+  }
+  if (normalized === normalizedKeyword) {
+    return { raw: rawCandidate, normalized, matchMethod: 'exact' };
+  }
+  if (normalized.includes(normalizedKeyword)) {
+    return { raw: rawCandidate, normalized, matchMethod: 'contains' };
+  }
+  const terms = normalizedKeyword.split(' ').filter(Boolean);
+  if (terms.length > 1 && terms.every((term) => normalized.includes(term))) {
+    return { raw: rawCandidate, normalized, matchMethod: 'all_terms' };
+  }
+  return null;
+}
+
+const SEARCH_CITY_POLLUTION_WORDS = [
+  '热门',
+  '北京',
+  '上海',
+  '天津',
+  '重庆',
+  '黑龙江',
+  '吉林',
+  '辽宁',
+  '内蒙古',
+  '河北',
+  '山西',
+  '陕西',
+  '山东',
+  '新疆',
+  '西藏',
+  '青海',
+  '甘肃',
+  '宁夏',
+  '河南',
+  '江苏',
+];
+
+export function isSearchJobCandidatePollutedByCity(candidates: string[]): boolean {
+  const normalized = candidates.map((item) => normalizeSearchCityText(item)).filter(Boolean);
+  if (normalized.length < 5) {
+    return false;
+  }
+  const hits = normalized.filter((item) => SEARCH_CITY_POLLUTION_WORDS.includes(item)).length;
+  return hits >= 5;
+}
+
+export function normalizeSearchCityText(value: string): string {
+  return value
+    .normalize('NFKC')
+    .replace(/[\u200b-\u200f\u202a-\u202e\ufeff]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+export function isSearchCityTextSelected(cityWrapText: string, city: string): boolean {
+  const normalizedCity = normalizeSearchCityText(city);
+  const normalizedText = normalizeSearchCityText(cityWrapText);
+  return !!normalizedCity && normalizedText.includes(normalizedCity);
+}
+
+export function pickSearchCityCandidate(city: string, candidates: string[]): string | null {
+  const normalizedCity = normalizeSearchCityText(city);
+  if (!normalizedCity) {
+    return null;
+  }
+  const normalizedCandidates = candidates
+    .map((raw) => ({ raw, normalized: normalizeSearchCityText(raw) }))
+    .filter((item) => item.normalized);
+  return (
+    normalizedCandidates.find((item) => item.normalized === normalizedCity)?.raw ??
+    normalizedCandidates.find((item) => item.normalized.includes(normalizedCity))?.raw ??
+    null
+  );
+}
 
 const AUTH_OR_RISK_PATTERN =
   /(?:\blogin\b|forbidden|captcha|risk|\u767b\u5f55|\u626b\u7801|\u9a8c\u8bc1\u7801|\u98ce\u63a7|\u8d26\u53f7)/i;
@@ -349,7 +449,7 @@ async function readSearchSelectedJobDropdownLabel(frame: Frame): Promise<string>
 async function readSearchSelectedCity(frame: Frame): Promise<string> {
   return (await frame.evaluate(`(() => {
     const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
-    const label = norm(document.querySelector(".search-job-list-C")?.textContent || document.querySelector(".city-wrap")?.textContent);
+    const label = norm(document.querySelector(".city-wrap")?.innerText || document.querySelector(".city-wrap")?.textContent);
     return label || "";
   })()`)) as string;
 }
@@ -358,15 +458,38 @@ async function isSearchCitySelected(frame: Frame, city: string): Promise<boolean
   return (await frame.evaluate(`(() => {
     const city = ${JSON.stringify(city)};
     const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
-    const text = norm(document.querySelector(".search-job-list-C")?.textContent);
+    const text = norm(document.querySelector(".city-wrap")?.innerText || document.querySelector(".city-wrap")?.textContent);
     return !!city && text.includes(city);
   })()`)) as boolean;
 }
 
-async function selectSearchJob(frame: Frame, keyword: string): Promise<string> {
+type SearchJobSelection = {
+  selectedJob: string;
+  matchMethod: string;
+  candidateSample: string[];
+};
+
+async function selectSearchJob(frame: Frame, keyword: string): Promise<SearchJobSelection> {
   const kw = keyword.trim();
   if (!kw) {
     throw new Error('resumes --from search 的 --job 不能为空。');
+  }
+  await frame.evaluate(`(() => {
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true }));
+    document.dispatchEvent(new KeyboardEvent("keyup", { key: "Escape", code: "Escape", bubbles: true }));
+    const searchContainer = document.querySelector(".search-container");
+    if (searchContainer instanceof HTMLElement) searchContainer.click();
+    return true;
+  })()`);
+  await sleepRandom(120, 220);
+  const currentJob = await readSearchSelectedJobDropdownLabel(frame);
+  const currentJobMatch = matchSearchJobCandidate(kw, currentJob);
+  if (currentJobMatch) {
+    return {
+      selectedJob: currentJob,
+      matchMethod: currentJobMatch.matchMethod,
+      candidateSample: [currentJob],
+    };
   }
   const clicked = (await frame.evaluate(`(() => {
     const label = document.querySelector(".search-job-list-C .ui-dropmenu-label");
@@ -396,38 +519,83 @@ async function selectSearchJob(frame: Frame, keyword: string): Promise<string> {
   })()`);
   await sleepRandom(500, 800);
 
-  const selected = (await frame.evaluate(`(() => {
+  const result = (await frame.evaluate(`(() => {
     const keyword = ${JSON.stringify(kw)};
     const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
+    const currentJobText = norm(document.querySelector(".search-job-list-C .ui-dropmenu-label")?.innerText || document.querySelector(".search-job-list-C .ui-dropmenu-label")?.textContent);
+    const currentCityText = norm(document.querySelector(".city-wrap")?.innerText || document.querySelector(".city-wrap")?.textContent);
+    const normalizeJob = (value) => norm(value)
+      .normalize("NFKC")
+      .toLowerCase()
+      .replace(/[\\u200b-\\u200f\\u202a-\\u202e\\ufeff]/g, "")
+      .replace(/[^\\p{L}\\p{N}]+/gu, " ")
+      .replace(/\\s+/g, " ")
+      .trim();
+    const normalizedKeyword = normalizeJob(keyword);
+    const matchMethod = (candidate) => {
+      const normalized = normalizeJob(candidate);
+      if (!normalizedKeyword || !normalized) return "";
+      if (normalized === normalizedKeyword) return "exact";
+      if (normalized.includes(normalizedKeyword)) return "contains";
+      const terms = normalizedKeyword.split(" ").filter(Boolean);
+      if (terms.length > 1 && terms.every((term) => normalized.includes(term))) return "all_terms";
+      return "";
+    };
+    const methodRank = { exact: 0, contains: 1, all_terms: 2 };
     const isVisible = (el) => {
       const rect = el.getBoundingClientRect();
       const style = window.getComputedStyle(el);
       return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
     };
     const selectors = [
-      ".ui-dropmenu-list li",
-      ".ui-dropmenu-list .ui-dropmenu-item",
       ".job-dropmenu-list li",
       ".job-dropmenu-item",
       ".job-list .job-item",
-      ".job-item",
-      "[class*='drop'] li",
-      "[class*='popover'] li"
+      ".search-job-list-C .job-item"
     ];
-    const items = Array.from(document.querySelectorAll(selectors.join(",")))
-      .filter((el) => el instanceof HTMLElement && isVisible(el));
-    const target = items.find((el) => norm(el.textContent).includes(keyword));
-    if (!(target instanceof HTMLElement)) return "";
-    const text = norm(target.textContent);
-    target.scrollIntoView({ block: "center", inline: "nearest" });
-    target.click();
-    return text;
-  })()`)) as string;
-  if (!selected) {
-    throw new Error(`搜索页岗位下拉中未找到匹配岗位：${kw}`);
+    const rows = Array.from(document.querySelectorAll(selectors.join(",")))
+      .filter((el) => el instanceof HTMLElement && isVisible(el))
+      .map((el, index) => {
+        const raw = norm(el.innerText || el.textContent || "");
+        return { el, index, raw, normalized: normalizeJob(raw), matchMethod: matchMethod(raw) };
+      })
+      .filter((row) => row.raw);
+    const sample = rows
+      .map((row) => ({ raw: row.raw, normalized: row.normalized }))
+      .slice(0, 20);
+    const matches = rows
+      .filter((row) => row.matchMethod)
+      .sort((a, b) => methodRank[a.matchMethod] - methodRank[b.matchMethod] || a.index - b.index);
+    const target = matches[0];
+    if (!target || !(target.el instanceof HTMLElement)) {
+      return { selected: "", normalizedKeyword, matchMethod: "", sample, currentJobText, currentCityText };
+    }
+    target.el.scrollIntoView({ block: "center", inline: "nearest" });
+    target.el.click();
+    return { selected: target.raw, normalizedKeyword, matchMethod: target.matchMethod, sample, currentJobText, currentCityText };
+  })()`)) as {
+    selected: string;
+    normalizedKeyword: string;
+    matchMethod: string;
+    sample: Array<{ raw: string; normalized: string }>;
+    currentJobText: string;
+    currentCityText: string;
+  };
+  if (!result.selected) {
+    const candidates = result.sample.length > 0
+      ? result.sample.map((item) => `${item.raw} [${item.normalized}]`).join(' / ')
+      : '无可见岗位候选';
+    const pollutionHint = isSearchJobCandidatePollutedByCity(result.sample.map((item) => item.raw))
+      ? '；检测到候选项像城市/省份列表，疑似岗位弹层被城市弹层污染'
+      : '';
+    throw new Error(`搜索页岗位下拉中未找到匹配岗位：${kw}；规范化关键词：${result.normalizedKeyword}；当前岗位文本：${result.currentJobText || '空'}；当前城市文本：${result.currentCityText || '空'}；可见候选：${candidates}${pollutionHint}`);
   }
   await sleepRandom(400, 700);
-  return readSearchSelectedJobDropdownLabel(frame);
+  return {
+    selectedJob: await readSearchSelectedJobDropdownLabel(frame),
+    matchMethod: result.matchMethod,
+    candidateSample: result.sample.map((item) => item.raw),
+  };
 }
 
 async function selectSearchCity(frame: Frame, city: string): Promise<string> {
@@ -455,12 +623,15 @@ async function selectSearchCity(frame: Frame, city: string): Promise<string> {
         const style = window.getComputedStyle(el);
         return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
       };
-      const items = Array.from(document.querySelectorAll(".city-select-panel *, .city-list *, .city-panel *, .city-picker *, [class*='city'] *"))
+      const items = Array.from(document.querySelectorAll(".city-select-panel *, .city-list *, .city-panel *, .city-picker *, .ui-dropmenu-list *, [class*='city'] *"))
         .filter((el) => el instanceof HTMLElement && isVisible(el))
         .filter((el) => norm(el.textContent) === province);
       const target = items[0];
       if (!(target instanceof HTMLElement)) return false;
       target.scrollIntoView({ block: "center", inline: "nearest" });
+      target.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, view: window }));
+      target.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true, view: window }));
+      target.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, view: window }));
       target.click();
       return true;
     })()`)) as boolean;
@@ -472,6 +643,7 @@ async function selectSearchCity(frame: Frame, city: string): Promise<string> {
   const result = (await frame.evaluate(`(() => {
     const city = ${JSON.stringify(targetCity)};
     const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
+    const currentCityText = norm(document.querySelector(".city-wrap")?.innerText || document.querySelector(".city-wrap")?.textContent);
     const isVisible = (el) => {
       const rect = el.getBoundingClientRect();
       const style = window.getComputedStyle(el);
@@ -505,36 +677,31 @@ async function selectSearchCity(frame: Frame, city: string): Promise<string> {
       "[class*='city'] a",
       "[class*='city'] span",
       "[class*='city'] dd",
-      "[class*='city'] p",
-      "[class*='popover'] li",
-      "[class*='popover'] a",
-      "[class*='popover'] span",
-      "[class*='popover'] dd",
-      "[class*='popover'] p"
+      "[class*='city'] p"
     ];
     const items = Array.from(document.querySelectorAll(selectors.join(",")))
       .filter((el) => el instanceof HTMLElement && isVisible(el))
       .filter((el) => {
-        const text = norm(el.textContent);
+        const text = norm(el.innerText || el.textContent);
         return text && text.length <= 20;
       });
-    const target = items.find((el) => norm(el.textContent) === city) || items.find((el) => {
-      const text = norm(el.textContent);
+    const target = items.find((el) => norm(el.innerText || el.textContent) === city) || items.find((el) => {
+      const text = norm(el.innerText || el.textContent);
       return text.includes(city);
     });
-    const visibleTexts = Array.from(new Set(items.map((el) => norm(el.textContent)).filter(Boolean))).slice(0, 40);
-    if (!(target instanceof HTMLElement)) return { selected: "", visibleTexts };
-    const text = norm(target.textContent);
+    const visibleTexts = Array.from(new Set(items.map((el) => norm(el.innerText || el.textContent)).filter(Boolean))).slice(0, 40);
+    if (!(target instanceof HTMLElement)) return { selected: "", visibleTexts, currentCityText };
+    const text = norm(target.innerText || target.textContent);
     target.scrollIntoView({ block: "center", inline: "nearest" });
     target.click();
-    return { selected: text, visibleTexts };
-  })()`)) as { selected: string; visibleTexts: string[] };
+    return { selected: text, visibleTexts, currentCityText };
+  })()`)) as { selected: string; visibleTexts: string[]; currentCityText: string };
   if (!result.selected) {
     if (await isSearchCitySelected(frame, targetCity)) {
       return targetCity;
     }
-    const candidates = result.visibleTexts.length > 0 ? result.visibleTexts.join(' / ') : '无可见城市候选';
-    throw new Error(`搜索页城市选择中未找到匹配城市：${targetCity}；可见候选：${candidates}`);
+    const candidates = result.visibleTexts.length > 0 ? result.visibleTexts.join(' / ') : '城市弹层无可见候选';
+    throw new Error(`搜索页城市选择中未找到匹配城市：${targetCity}；当前城市文本：${result.currentCityText || '空'}；可见候选：${candidates}`);
   }
   await sleepRandom(400, 700);
   return readSearchSelectedCity(frame);
@@ -570,9 +737,13 @@ async function runSearchPageQuery(page: Page, options: ResumeSyncCliOptions): Pr
   const searchFrame = await getSearchFrame(page);
   await ensureSearchControlsReady(searchFrame);
 
-  const selectedJob = options.jobKeyword
+  const jobSelection = options.jobKeyword
     ? await selectSearchJob(searchFrame, options.jobKeyword)
-    : await readSearchSelectedJobDropdownLabel(searchFrame);
+    : {
+        selectedJob: await readSearchSelectedJobDropdownLabel(searchFrame),
+        matchMethod: '',
+        candidateSample: [],
+      };
   const selectedCity = options.city
     ? await selectSearchCity(searchFrame, options.city)
     : await readSearchSelectedCity(searchFrame);
@@ -591,7 +762,9 @@ async function runSearchPageQuery(page: Page, options: ResumeSyncCliOptions): Pr
     keyword: options.keyword,
     requestedJobKeyword: options.jobKeyword ?? '',
     requestedCity: options.city ?? '',
-    selectedJob,
+    selectedJob: jobSelection.selectedJob,
+    jobMatchMethod: jobSelection.matchMethod,
+    jobCandidateSample: jobSelection.candidateSample,
     selectedCity,
     resultUrl: searchFrame.url(),
     candidateCount: candidates.length,
@@ -1265,6 +1438,8 @@ export async function collectSourceCandidates(
         searchKeyword: context.keyword,
         searchRequestedJob: context.requestedJobKeyword,
         searchSelectedJob: context.selectedJob,
+        searchJobMatchMethod: context.jobMatchMethod,
+        searchJobCandidateSample: context.jobCandidateSample.join(' | '),
         searchRequestedCity: context.requestedCity,
         searchSelectedCity: context.selectedCity,
         searchResultUrl: context.resultUrl,
@@ -1328,6 +1503,8 @@ async function collectSourceCandidatesWithContext(
         searchKeyword: runContext.keyword,
         searchRequestedJob: runContext.requestedJobKeyword,
         searchSelectedJob: runContext.selectedJob,
+        searchJobMatchMethod: runContext.jobMatchMethod,
+        searchJobCandidateSample: runContext.jobCandidateSample.join(' | '),
         searchRequestedCity: runContext.requestedCity,
         searchSelectedCity: runContext.selectedCity,
         searchResultUrl: runContext.resultUrl,
