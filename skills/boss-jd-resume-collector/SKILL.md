@@ -87,15 +87,16 @@ powershell -ExecutionPolicy Bypass -File "<skill_dir>\scripts\collect_boss_resum
 ```text
 boss resumes --from chat --limit 3 --json
 boss resumes --from recommend --limit 3 --json --job <keyword>
-boss resumes --from search --keyword <keyword> --limit 3 --json
+boss resumes --from search --keyword <keyword> --job <keyword> --limit 3 --json
 ```
 
-采集前自检只检查：
+采集前自检使用真实简历下载 probe，每个来源至少验证 1 份可用简历：
 
 ```text
 boss help
-boss recommend <keyword>
 boss resumes --from chat --limit 1 --json
+boss resumes --from recommend --job <keyword> --limit 1 --json
+boss resumes --from search --keyword <keyword> --job <keyword> --limit 1 --json
 ```
 
 如需收窄搜索页筛选，可以显式传入 search 专用参数：
@@ -104,7 +105,7 @@ boss resumes --from chat --limit 1 --json
 powershell -ExecutionPolicy Bypass -File "<skill_dir>\scripts\collect_boss_resumes.ps1" -JdFile "<jd.md>" -JobKeyword "<keyword>" -SearchKeyword "<keyword>" -SearchCity "<city>"
 ```
 
-只有显式传入 `-SearchJob` / `--search-job` 时，search 命令才会追加 `--job`：
+默认会用 `JobKeyword` 自动匹配 search 页岗位下拉；显式传入 `-SearchJob` / `--search-job` 时会覆盖默认岗位：
 
 ```text
 boss resumes --from search --keyword <keyword> --job <job> --limit 3 --json

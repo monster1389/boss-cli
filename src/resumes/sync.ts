@@ -94,10 +94,49 @@ type ResumeSyncSearchContext = {
   requestedJobKeyword: string;
   requestedCity: string;
   selectedJob: string;
+  jobMatchMethod: string;
+  jobCandidateSample: string[];
   selectedCity: string;
   resultUrl: string;
   candidateCount: number;
 };
+
+export type SearchJobMatchMethod = 'exact' | 'contains' | 'all_terms';
+
+export type SearchJobMatchCandidate = {
+  raw: string;
+  normalized: string;
+  matchMethod: SearchJobMatchMethod;
+};
+
+export function normalizeSearchJobText(value: string): string {
+  return value
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\u200b-\u200f\u202a-\u202e\ufeff]/g, '')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+export function matchSearchJobCandidate(keyword: string, rawCandidate: string): SearchJobMatchCandidate | null {
+  const normalizedKeyword = normalizeSearchJobText(keyword);
+  const normalized = normalizeSearchJobText(rawCandidate);
+  if (!normalizedKeyword || !normalized) {
+    return null;
+  }
+  if (normalized === normalizedKeyword) {
+    return { raw: rawCandidate, normalized, matchMethod: 'exact' };
+  }
+  if (normalized.includes(normalizedKeyword)) {
+    return { raw: rawCandidate, normalized, matchMethod: 'contains' };
+  }
+  const terms = normalizedKeyword.split(' ').filter(Boolean);
+  if (terms.length > 1 && terms.every((term) => normalized.includes(term))) {
+    return { raw: rawCandidate, normalized, matchMethod: 'all_terms' };
+  }
+  return null;
+}
 
 const AUTH_OR_RISK_PATTERN =
   /(?:\blogin\b|forbidden|captcha|risk|\u767b\u5f55|\u626b\u7801|\u9a8c\u8bc1\u7801|\u98ce\u63a7|\u8d26\u53f7)/i;
@@ -363,7 +402,13 @@ async function isSearchCitySelected(frame: Frame, city: string): Promise<boolean
   })()`)) as boolean;
 }
 
-async function selectSearchJob(frame: Frame, keyword: string): Promise<string> {
+type SearchJobSelection = {
+  selectedJob: string;
+  matchMethod: string;
+  candidateSample: string[];
+};
+
+async function selectSearchJob(frame: Frame, keyword: string): Promise<SearchJobSelection> {
   const kw = keyword.trim();
   if (!kw) {
     throw new Error('resumes --from search 的 --job 不能为空。');
@@ -396,9 +441,27 @@ async function selectSearchJob(frame: Frame, keyword: string): Promise<string> {
   })()`);
   await sleepRandom(500, 800);
 
-  const selected = (await frame.evaluate(`(() => {
+  const result = (await frame.evaluate(`(() => {
     const keyword = ${JSON.stringify(kw)};
     const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
+    const normalizeJob = (value) => norm(value)
+      .normalize("NFKC")
+      .toLowerCase()
+      .replace(/[\\u200b-\\u200f\\u202a-\\u202e\\ufeff]/g, "")
+      .replace(/[^\\p{L}\\p{N}]+/gu, " ")
+      .replace(/\\s+/g, " ")
+      .trim();
+    const normalizedKeyword = normalizeJob(keyword);
+    const matchMethod = (candidate) => {
+      const normalized = normalizeJob(candidate);
+      if (!normalizedKeyword || !normalized) return "";
+      if (normalized === normalizedKeyword) return "exact";
+      if (normalized.includes(normalizedKeyword)) return "contains";
+      const terms = normalizedKeyword.split(" ").filter(Boolean);
+      if (terms.length > 1 && terms.every((term) => normalized.includes(term))) return "all_terms";
+      return "";
+    };
+    const methodRank = { exact: 0, contains: 1, all_terms: 2 };
     const isVisible = (el) => {
       const rect = el.getBoundingClientRect();
       const style = window.getComputedStyle(el);
@@ -414,20 +477,39 @@ async function selectSearchJob(frame: Frame, keyword: string): Promise<string> {
       "[class*='drop'] li",
       "[class*='popover'] li"
     ];
-    const items = Array.from(document.querySelectorAll(selectors.join(",")))
-      .filter((el) => el instanceof HTMLElement && isVisible(el));
-    const target = items.find((el) => norm(el.textContent).includes(keyword));
-    if (!(target instanceof HTMLElement)) return "";
-    const text = norm(target.textContent);
-    target.scrollIntoView({ block: "center", inline: "nearest" });
-    target.click();
-    return text;
-  })()`)) as string;
-  if (!selected) {
-    throw new Error(`搜索页岗位下拉中未找到匹配岗位：${kw}`);
+    const rows = Array.from(document.querySelectorAll(selectors.join(",")))
+      .filter((el) => el instanceof HTMLElement && isVisible(el))
+      .map((el, index) => {
+        const raw = norm(el.innerText || el.textContent || "");
+        return { el, index, raw, normalized: normalizeJob(raw), matchMethod: matchMethod(raw) };
+      })
+      .filter((row) => row.raw);
+    const sample = rows
+      .map((row) => ({ raw: row.raw, normalized: row.normalized }))
+      .slice(0, 20);
+    const matches = rows
+      .filter((row) => row.matchMethod)
+      .sort((a, b) => methodRank[a.matchMethod] - methodRank[b.matchMethod] || a.index - b.index);
+    const target = matches[0];
+    if (!target || !(target.el instanceof HTMLElement)) {
+      return { selected: "", normalizedKeyword, matchMethod: "", sample };
+    }
+    target.el.scrollIntoView({ block: "center", inline: "nearest" });
+    target.el.click();
+    return { selected: target.raw, normalizedKeyword, matchMethod: target.matchMethod, sample };
+  })()`)) as { selected: string; normalizedKeyword: string; matchMethod: string; sample: Array<{ raw: string; normalized: string }> };
+  if (!result.selected) {
+    const candidates = result.sample.length > 0
+      ? result.sample.map((item) => `${item.raw} [${item.normalized}]`).join(' / ')
+      : '无可见岗位候选';
+    throw new Error(`搜索页岗位下拉中未找到匹配岗位：${kw}；规范化关键词：${result.normalizedKeyword}；可见候选：${candidates}`);
   }
   await sleepRandom(400, 700);
-  return readSearchSelectedJobDropdownLabel(frame);
+  return {
+    selectedJob: await readSearchSelectedJobDropdownLabel(frame),
+    matchMethod: result.matchMethod,
+    candidateSample: result.sample.map((item) => item.raw),
+  };
 }
 
 async function selectSearchCity(frame: Frame, city: string): Promise<string> {
@@ -570,9 +652,13 @@ async function runSearchPageQuery(page: Page, options: ResumeSyncCliOptions): Pr
   const searchFrame = await getSearchFrame(page);
   await ensureSearchControlsReady(searchFrame);
 
-  const selectedJob = options.jobKeyword
+  const jobSelection = options.jobKeyword
     ? await selectSearchJob(searchFrame, options.jobKeyword)
-    : await readSearchSelectedJobDropdownLabel(searchFrame);
+    : {
+        selectedJob: await readSearchSelectedJobDropdownLabel(searchFrame),
+        matchMethod: '',
+        candidateSample: [],
+      };
   const selectedCity = options.city
     ? await selectSearchCity(searchFrame, options.city)
     : await readSearchSelectedCity(searchFrame);
@@ -591,7 +677,9 @@ async function runSearchPageQuery(page: Page, options: ResumeSyncCliOptions): Pr
     keyword: options.keyword,
     requestedJobKeyword: options.jobKeyword ?? '',
     requestedCity: options.city ?? '',
-    selectedJob,
+    selectedJob: jobSelection.selectedJob,
+    jobMatchMethod: jobSelection.matchMethod,
+    jobCandidateSample: jobSelection.candidateSample,
     selectedCity,
     resultUrl: searchFrame.url(),
     candidateCount: candidates.length,
@@ -1265,6 +1353,8 @@ export async function collectSourceCandidates(
         searchKeyword: context.keyword,
         searchRequestedJob: context.requestedJobKeyword,
         searchSelectedJob: context.selectedJob,
+        searchJobMatchMethod: context.jobMatchMethod,
+        searchJobCandidateSample: context.jobCandidateSample.join(' | '),
         searchRequestedCity: context.requestedCity,
         searchSelectedCity: context.selectedCity,
         searchResultUrl: context.resultUrl,
@@ -1328,6 +1418,8 @@ async function collectSourceCandidatesWithContext(
         searchKeyword: runContext.keyword,
         searchRequestedJob: runContext.requestedJobKeyword,
         searchSelectedJob: runContext.selectedJob,
+        searchJobMatchMethod: runContext.jobMatchMethod,
+        searchJobCandidateSample: runContext.jobCandidateSample.join(' | '),
         searchRequestedCity: runContext.requestedCity,
         searchSelectedCity: runContext.selectedCity,
         searchResultUrl: runContext.resultUrl,

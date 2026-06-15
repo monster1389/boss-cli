@@ -173,5 +173,7 @@ $manifest = [ordered]@{
   git = $git
   boss_bin = $bossCmd
 }
-$manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
-$manifest | ConvertTo-Json -Depth 5
+$manifestJson = $manifest | ConvertTo-Json -Depth 5
+$utf8NoBom = New-Object System.Text.UTF8Encoding $false
+[System.IO.File]::WriteAllText($manifestPath, ($manifestJson + [Environment]::NewLine), $utf8NoBom)
+$manifestJson

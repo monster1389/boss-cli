@@ -166,7 +166,7 @@ def resolve_boss_bin(explicit_boss_bin: str | None) -> tuple[str | None, dict[st
     manifest_exists, manifest_error = safe_path_exists(manifest_path)
     if manifest_exists:
         try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
             manifest_boss_bin = str(manifest.get("boss_bin") or "").strip()
             if manifest_boss_bin:
                 candidates.append(("skill_toolchain_manifest", manifest_boss_bin))
@@ -279,11 +279,141 @@ def classify_failure(text: str, *, json_error: bool = False, usable_count: int |
     return None
 
 
-def run_preflight(boss_bin: str, job_keyword: str, timeout_seconds: int) -> dict[str, Any]:
+def build_boss_resumes_command(
+    boss_bin: str,
+    source: str,
+    root: Path,
+    limit: int,
+    job_keyword: str | None,
+    search_keyword: str | None = None,
+    search_job: str | None = None,
+    search_city: str | None = None,
+) -> list[str]:
+    cmd = boss_cmd(
+        boss_bin,
+        "resumes",
+        "--from",
+        source,
+        "--limit",
+        str(limit),
+        "--root",
+        str(root),
+        "--json",
+    )
+    if source == "recommend" and job_keyword:
+        cmd.extend(["--job", job_keyword])
+    if source == "search":
+        if search_keyword:
+            cmd.extend(["--keyword", search_keyword])
+        if search_job:
+            cmd.extend(["--job", search_job])
+        if search_city:
+            cmd.extend(["--city", search_city])
+    return cmd
+
+
+def count_usable_results(source_result: dict[str, Any]) -> int:
+    usable_count = 0
+    for item in source_result.get("results", []):
+        status = item.get("status")
+        artifacts = item.get("artifacts") or {}
+        resume_md = artifacts.get("resumeMarkdownPath")
+        resume_json = artifacts.get("resumeJsonPath")
+        if status in USABLE_STATUSES and path_exists(resume_md) and path_exists(resume_json):
+            usable_count += 1
+    return usable_count
+
+
+def run_boss_resumes_command(cmd: list[str], source: str, timeout_seconds: int) -> dict[str, Any]:
+    completed = run_command(cmd, timeout_seconds=timeout_seconds)
+    if not completed["ok"]:
+        combined = f"{completed.get('stdout', '')}\n{completed.get('stderr', '')}"
+        return {
+            "ok": False,
+            "source": source,
+            "command": cmd,
+            "exit_code": completed.get("exit_code"),
+            "stdout": completed.get("stdout", ""),
+            "stderr": completed.get("stderr", ""),
+            "results": [],
+            "counts": {},
+            "usable_count": 0,
+            "failure_kind": completed.get("failure_kind") or classify_failure(combined) or "unknown",
+            "errors": [completed.get("stderr", "").strip() or completed.get("stdout", "").strip() or "boss resumes failed"],
+        }
+
+    try:
+        parsed = json.loads(completed["stdout"])
+    except json.JSONDecodeError as exc:
+        return {
+            "ok": False,
+            "source": source,
+            "command": cmd,
+            "exit_code": completed.get("exit_code"),
+            "stdout": completed.get("stdout", ""),
+            "stderr": completed.get("stderr", ""),
+            "results": [],
+            "counts": {},
+            "usable_count": 0,
+            "failure_kind": "json_parse_failed",
+            "errors": [f"boss resumes did not return valid JSON: {exc}"],
+        }
+
+    parsed["command"] = cmd
+    parsed["exit_code"] = completed.get("exit_code")
+    parsed["stderr"] = completed.get("stderr", "")
+    parsed["failure_kind"] = None
+    return parsed
+
+
+def run_resume_probe(
+    boss_bin: str,
+    source: str,
+    root: Path,
+    job_keyword: str,
+    search_keyword: str | None,
+    search_job: str | None,
+    search_city: str | None,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    cmd = build_boss_resumes_command(
+        boss_bin,
+        source,
+        root,
+        1,
+        job_keyword,
+        search_keyword=search_keyword,
+        search_job=search_job,
+        search_city=search_city,
+    )
+    result = run_boss_resumes_command(cmd, source, timeout_seconds)
+    usable_count = count_usable_results(result)
+    result["usable_count"] = usable_count
+    if not result.get("ok"):
+        result["message"] = result.get("stderr") or result.get("stdout") or f"{source} resume probe failed"
+        return result
+    if usable_count < 1:
+        result["ok"] = False
+        result["failure_kind"] = "insufficient_data"
+        result["message"] = f"{source} resume probe returned {usable_count} usable resumes"
+        result["errors"] = [result["message"]]
+        return result
+    result["failure_kind"] = None
+    result["message"] = ""
+    return result
+
+
+def run_preflight(
+    boss_bin: str,
+    job_keyword: str,
+    resume_root: Path,
+    search_keyword: str,
+    search_job: str,
+    search_city: str | None,
+    timeout_seconds: int,
+) -> dict[str, Any]:
     checks = [
         ("boss_help", boss_cmd(boss_bin, "help")),
-        ("recommend_page", boss_cmd(boss_bin, "recommend", job_keyword)),
-        ("chat_resume_probe", boss_cmd(boss_bin, "resumes", "--from", "chat", "--limit", "1", "--json")),
     ]
     results: list[dict[str, Any]] = []
     for name, cmd in checks:
@@ -296,6 +426,20 @@ def run_preflight(boss_bin: str, job_keyword: str, timeout_seconds: int) -> dict
             result["failure_kind"] = None
             result["message"] = ""
         result["name"] = name
+        results.append(result)
+
+    for source in DEFAULT_SOURCES:
+        result = run_resume_probe(
+            boss_bin,
+            source,
+            resume_root,
+            job_keyword,
+            search_keyword,
+            search_job,
+            search_city,
+            timeout_seconds,
+        )
+        result["name"] = f"{source}_resume_probe"
         results.append(result)
 
     failed = [item for item in results if not item["ok"]]
@@ -317,19 +461,16 @@ def run_boss_resumes(
     search_city: str | None = None,
     timeout_seconds: int = 180,
 ) -> dict[str, Any]:
-    cmd = boss_cmd(
+    cmd = build_boss_resumes_command(
         boss_bin,
-        "resumes",
-        "--from",
         source,
-        "--limit",
-        "3",
-        "--root",
-        str(root),
-        "--json",
+        root,
+        3,
+        job_keyword,
+        search_keyword=search_keyword,
+        search_job=search_job,
+        search_city=search_city,
     )
-    if source == "recommend" and job_keyword:
-        cmd.extend(["--job", job_keyword])
     if source == "search":
         if not search_keyword:
             return {
@@ -345,11 +486,6 @@ def run_boss_resumes(
                 "failure_kind": "insufficient_data",
                 "errors": ["搜索关键词不明确。请传入 --search-keyword 或 --job-keyword。"],
             }
-        cmd.extend(["--keyword", search_keyword])
-        if search_job:
-            cmd.extend(["--job", search_job])
-        if search_city:
-            cmd.extend(["--city", search_city])
 
     completed = run_command(cmd, timeout_seconds=timeout_seconds)
     if not completed["ok"]:
@@ -605,7 +741,7 @@ def main() -> int:
         raise SystemExit("岗位关键词不明确。请先传入 --job-keyword 后再采集简历。")
 
     search_keyword = (args.search_keyword or "").strip() or job_keyword
-    search_job = (args.search_job or "").strip() or None
+    search_job = (args.search_job or "").strip() or job_keyword
     search_city = (args.search_city or "").strip() or None
 
     created_at = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -628,7 +764,15 @@ def main() -> int:
         }
         sources = {source: empty_source_result(source, "boss_not_found", boss_info["message"]) for source in requested_sources}
     else:
-        preflight = run_preflight(boss_bin, job_keyword, args.command_timeout_seconds)
+        preflight = run_preflight(
+            boss_bin,
+            job_keyword,
+            resume_root,
+            search_keyword,
+            search_job,
+            search_city,
+            args.command_timeout_seconds,
+        )
         sources = {}
         if preflight["ok"]:
             for source in requested_sources:
