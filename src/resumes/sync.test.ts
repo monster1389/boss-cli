@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildRecruiterResumeInfoUrl, matchSearchJobCandidate } from './sync.js';
+import {
+  buildRecruiterResumeInfoUrl,
+  isSearchCityTextSelected,
+  isSearchJobCandidatePollutedByCity,
+  matchSearchJobCandidate,
+  pickSearchCityCandidate,
+} from './sync.js';
 
 test('buildRecruiterResumeInfoUrl targets recruiter geek info endpoint with identifiers', () => {
   const url = new URL(buildRecruiterResumeInfoUrl({
@@ -37,4 +43,29 @@ test('matchSearchJobCandidate matches multi-term job keywords', () => {
 
 test('matchSearchJobCandidate returns null for unrelated jobs', () => {
   assert.equal(matchSearchJobCandidate('Java 后端', '产品经理'), null);
+});
+
+test('isSearchJobCandidatePollutedByCity detects city dropdown samples', () => {
+  assert.equal(isSearchJobCandidatePollutedByCity(['热门', '北京', '上海', '天津', '重庆', '黑龙江']), true);
+});
+
+test('isSearchJobCandidatePollutedByCity does not flag job samples', () => {
+  assert.equal(isSearchJobCandidatePollutedByCity(['Java', 'Java开发', 'Java后端', '后端开发']), false);
+});
+
+test('isSearchCityTextSelected matches selected city text from city wrap', () => {
+  assert.equal(isSearchCityTextSelected('广州', '广州'), true);
+  assert.equal(isSearchCityTextSelected('当前城市 广州', '广州'), true);
+});
+
+test('pickSearchCityCandidate prefers exact city candidate', () => {
+  assert.equal(pickSearchCityCandidate('广州', ['广州市', '广州']), '广州');
+});
+
+test('pickSearchCityCandidate allows contains match for city candidates', () => {
+  assert.equal(pickSearchCityCandidate('广州', ['广州市']), '广州市');
+});
+
+test('pickSearchCityCandidate returns null when city is absent', () => {
+  assert.equal(pickSearchCityCandidate('广州', ['深圳', '佛山']), null);
 });
