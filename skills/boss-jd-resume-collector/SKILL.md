@@ -13,7 +13,9 @@ description: 当用户想输入 JD/岗位描述并采集 BOSS 直聘候选人简
 
 本 skill 面向“只安装 Codex、没有配置 Python/Node/Git”的 Windows 机器。优先使用 PowerShell 脚本，不要求系统已安装 Python。
 
-所有 bootstrap 和采集命令都必须在非 sandbox 环境执行：它们会访问网络、写入 `~/.boss-cli`、写入 `%APPDATA%\npm\boss.cmd`、启动/复用 BOSS 浏览器会话。
+> 重要：所有 bootstrap 和采集命令都必须在非 sandbox 的本机用户环境执行，不能在 Codex 沙箱、受限 shell 或容器里跑。它们需要访问网络、读写 `~/.boss-cli` / `%APPDATA%\npm`、解析真实 PATH、启动/复用 BOSS 浏览器会话；沙箱里通常会找不到 `boss.cmd`，或无法启动/复用 BOSS 浏览器。
+>
+> 如果当前环境解析不到 `boss`，不要改用 PATH 上陌生的 `boss.exe`。先运行 bootstrap，或显式传入 bootstrap 生成的 `-BossBin "$HOME\.boss-cli\bin\boss.cmd"` / `--boss-bin "$HOME\.boss-cli\bin\boss.cmd"`；采集脚本也会优先读取 `~\.boss-cli\toolchain\boss-command.json`。
 
 拿到单个 `boss-jd-resume-collector.zip` 后，先解压到 Codex skills 目录：
 
