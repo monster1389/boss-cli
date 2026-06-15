@@ -99,6 +99,9 @@ type ResumeSyncSearchContext = {
   selectedCity: string;
   resultUrl: string;
   candidateCount: number;
+  rawCandidateCount?: number;
+  uniqueCandidateCount?: number;
+  duplicateCandidateCount?: number;
 };
 
 export type SearchJobMatchMethod = 'exact' | 'contains' | 'all_terms';
@@ -181,6 +184,48 @@ export function hasSearchCityOverlayResidue(currentCityText: string, jobCandidat
   }
   const hits = SEARCH_CITY_POLLUTION_WORDS.filter((word) => normalizedCityText.includes(word)).length;
   return hits >= 5;
+}
+
+export function searchCandidateDedupeKey(candidate: SourceCandidate, jobLabel: string): string {
+  const id = candidate.visibleGeekId || candidate.sourceMeta.candidateId;
+  if (typeof id === 'string' && id.trim()) {
+    return `id:${id.trim()}`;
+  }
+  const listIndex = pickNumber(candidate.sourceMeta, 'listIndex');
+  return `fallback:${candidate.name}|${jobLabel}|${listIndex ?? 'unknown'}`;
+}
+
+export function pickUniqueSearchCandidates(
+  candidates: SourceCandidate[],
+  limit: number,
+  jobLabel: string,
+): {
+  candidates: SourceCandidate[];
+  rawCandidateCount: number;
+  uniqueCandidateCount: number;
+  duplicateCandidateCount: number;
+} {
+  const seen = new Set<string>();
+  const unique: SourceCandidate[] = [];
+  let duplicateCandidateCount = 0;
+  for (const candidate of candidates) {
+    const key = searchCandidateDedupeKey(candidate, jobLabel);
+    if (seen.has(key)) {
+      duplicateCandidateCount += 1;
+      continue;
+    }
+    seen.add(key);
+    unique.push(candidate);
+    if (unique.length >= limit) {
+      break;
+    }
+  }
+  return {
+    candidates: unique,
+    rawCandidateCount: candidates.length,
+    uniqueCandidateCount: unique.length,
+    duplicateCandidateCount,
+  };
 }
 
 export function normalizeSearchCityText(value: string): string {
@@ -1484,7 +1529,8 @@ export async function collectSourceCandidates(
     const frame = await ensureSearchFrameReady(page);
     const selectedJob = context.selectedJob;
     const candidates = await readSearchCandidateList(frame);
-    return candidates.slice(0, options.limit).map((candidate) => ({
+    const uniqueSelection = pickUniqueSearchCandidates(candidates, options.limit, selectedJob || 'unknown-job');
+    return uniqueSelection.candidates.map((candidate) => ({
       source,
       name: candidate.name,
       jobLabel: selectedJob || 'unknown-job',
@@ -1501,6 +1547,9 @@ export async function collectSourceCandidates(
         searchRequestedCity: context.requestedCity,
         searchSelectedCity: context.selectedCity,
         searchResultUrl: context.resultUrl,
+        searchRawCandidateCount: uniqueSelection.rawCandidateCount,
+        searchUniqueCandidateCount: uniqueSelection.uniqueCandidateCount,
+        searchDuplicateCandidateCount: uniqueSelection.duplicateCandidateCount,
       }),
     }));
   }
@@ -1546,10 +1595,17 @@ async function collectSourceCandidatesWithContext(
   if (candidates.length === 0) {
     throw new ResumeSyncAbortError(`搜索已触发，但结果页没有候选人卡片（关键词：${runContext.keyword}）。`);
   }
+  const uniqueSelection = pickUniqueSearchCandidates(candidates, options.limit, selectedJob || runContext.selectedJob || 'unknown-job');
+  const searchContext: ResumeSyncSearchContext = {
+    ...runContext,
+    rawCandidateCount: uniqueSelection.rawCandidateCount,
+    uniqueCandidateCount: uniqueSelection.uniqueCandidateCount,
+    duplicateCandidateCount: uniqueSelection.duplicateCandidateCount,
+  };
 
   return {
-    searchContext: runContext,
-    candidates: candidates.slice(0, options.limit).map((candidate) => ({
+    searchContext,
+    candidates: uniqueSelection.candidates.map((candidate) => ({
       source,
       name: candidate.name,
       jobLabel: selectedJob || runContext.selectedJob || 'unknown-job',
@@ -1566,6 +1622,9 @@ async function collectSourceCandidatesWithContext(
         searchRequestedCity: runContext.requestedCity,
         searchSelectedCity: runContext.selectedCity,
         searchResultUrl: runContext.resultUrl,
+        searchRawCandidateCount: uniqueSelection.rawCandidateCount,
+        searchUniqueCandidateCount: uniqueSelection.uniqueCandidateCount,
+        searchDuplicateCandidateCount: uniqueSelection.duplicateCandidateCount,
       }),
     })),
   };
