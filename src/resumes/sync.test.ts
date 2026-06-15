@@ -2,10 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   buildRecruiterResumeInfoUrl,
+  hasSearchCityOverlayResidue,
   isSearchCityTextSelected,
   isSearchJobCandidatePollutedByCity,
   matchSearchJobCandidate,
   pickSearchCityCandidate,
+  resolveSelectedSearchJob,
 } from './sync.js';
 
 test('buildRecruiterResumeInfoUrl targets recruiter geek info endpoint with identifiers', () => {
@@ -45,12 +47,33 @@ test('matchSearchJobCandidate returns null for unrelated jobs', () => {
   assert.equal(matchSearchJobCandidate('Java 后端', '产品经理'), null);
 });
 
+test('resolveSelectedSearchJob treats matching current job label as selected', () => {
+  const match = resolveSelectedSearchJob('Java', 'Java');
+
+  assert.equal(match?.raw, 'Java');
+  assert.equal(match?.matchMethod, 'exact');
+});
+
+test('resolveSelectedSearchJob handles current job label when candidate list is empty', () => {
+  const emptyCandidates: string[] = [];
+  const match = resolveSelectedSearchJob('Java', 'Java');
+
+  assert.equal(emptyCandidates.length, 0);
+  assert.equal(match?.matchMethod, 'exact');
+});
+
 test('isSearchJobCandidatePollutedByCity detects city dropdown samples', () => {
   assert.equal(isSearchJobCandidatePollutedByCity(['热门', '北京', '上海', '天津', '重庆', '黑龙江']), true);
 });
 
 test('isSearchJobCandidatePollutedByCity does not flag job samples', () => {
   assert.equal(isSearchJobCandidatePollutedByCity(['Java', 'Java开发', 'Java后端', '后端开发']), false);
+});
+
+test('hasSearchCityOverlayResidue detects city overlay text when job candidates are empty', () => {
+  const cityText = '城市 热门 北京 上海 天津 重庆 黑龙江 吉林 辽宁';
+
+  assert.equal(hasSearchCityOverlayResidue(cityText, []), true);
 });
 
 test('isSearchCityTextSelected matches selected city text from city wrap', () => {
