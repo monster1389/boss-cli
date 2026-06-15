@@ -7,6 +7,7 @@ import {
   isSearchJobCandidatePollutedByCity,
   matchSearchJobCandidate,
   pickSearchCityCandidate,
+  pickUniqueSearchCandidates,
   resolveSelectedSearchJob,
 } from './sync.js';
 
@@ -74,6 +75,41 @@ test('hasSearchCityOverlayResidue detects city overlay text when job candidates 
   const cityText = '城市 热门 北京 上海 天津 重庆 黑龙江 吉林 辽宁';
 
   assert.equal(hasSearchCityOverlayResidue(cityText, []), true);
+});
+
+test('pickUniqueSearchCandidates skips duplicate visibleGeekId and keeps scanning', () => {
+  const picked = pickUniqueSearchCandidates([
+    { source: 'search', name: 'A1', jobLabel: 'Java', visibleGeekId: 'a', sourceMeta: { listIndex: 0 } },
+    { source: 'search', name: 'A2', jobLabel: 'Java', visibleGeekId: 'a', sourceMeta: { listIndex: 1 } },
+    { source: 'search', name: 'B', jobLabel: 'Java', visibleGeekId: 'b', sourceMeta: { listIndex: 2 } },
+    { source: 'search', name: 'C', jobLabel: 'Java', visibleGeekId: 'c', sourceMeta: { listIndex: 3 } },
+  ], 3, 'Java');
+
+  assert.deepEqual(picked.candidates.map((item) => item.visibleGeekId), ['a', 'b', 'c']);
+  assert.equal(picked.rawCandidateCount, 4);
+  assert.equal(picked.uniqueCandidateCount, 3);
+  assert.equal(picked.duplicateCandidateCount, 1);
+});
+
+test('pickUniqueSearchCandidates keeps fallback candidates with different listIndex', () => {
+  const picked = pickUniqueSearchCandidates([
+    { source: 'search', name: 'A', jobLabel: 'Java', sourceMeta: { listIndex: 0 } },
+    { source: 'search', name: 'A', jobLabel: 'Java', sourceMeta: { listIndex: 1 } },
+    { source: 'search', name: 'B', jobLabel: 'Java', sourceMeta: { listIndex: 2 } },
+  ], 3, 'Java');
+
+  assert.deepEqual(picked.candidates.map((item) => item.name), ['A', 'A', 'B']);
+  assert.equal(picked.duplicateCandidateCount, 0);
+});
+
+test('pickUniqueSearchCandidates preserves original listIndex after dedupe', () => {
+  const picked = pickUniqueSearchCandidates([
+    { source: 'search', name: 'A1', jobLabel: 'Java', visibleGeekId: 'a', sourceMeta: { listIndex: 0 } },
+    { source: 'search', name: 'A2', jobLabel: 'Java', visibleGeekId: 'a', sourceMeta: { listIndex: 1 } },
+    { source: 'search', name: 'B', jobLabel: 'Java', visibleGeekId: 'b', sourceMeta: { listIndex: 4 } },
+  ], 2, 'Java');
+
+  assert.deepEqual(picked.candidates.map((item) => item.sourceMeta.listIndex), [0, 4]);
 });
 
 test('isSearchCityTextSelected matches selected city text from city wrap', () => {
