@@ -90,7 +90,7 @@ boss resumes --from recommend --limit 3 --json --job <keyword>
 boss resumes --from search --keyword <keyword> --job <keyword> --limit 3 --json
 ```
 
-采集前自检使用真实简历下载 probe，每个来源至少验证 1 份可用简历：
+采集前会先运行硬性自检和真实简历下载 probe。`boss help` 是硬性自检，失败时不进入采集；`chat` / `recommend` / `search` probe 只用于诊断和预热，失败不会阻止后续正式采集：
 
 ```text
 boss help
@@ -98,6 +98,8 @@ boss resumes --from chat --limit 1 --json
 boss resumes --from recommend --job <keyword> --limit 1 --json
 boss resumes --from search --keyword <keyword> --job <keyword> --limit 1 --json
 ```
+
+`recommend` 和 `search` 的 probe 与正式采集会自动重试 3 次，summary/manifest 会保留每次 attempt 的命令、stdout、stderr、失败分类和可用简历数。
 
 如需收窄搜索页筛选，可以显式传入 search 专用参数：
 
@@ -116,7 +118,7 @@ boss resumes --from search --keyword <keyword> --job <job> --limit 3 --json
 - 默认模式下，`chat`、`recommend`、`search` 每个来源都必须有 3 份可用简历。
 - 可用状态只包括 `downloaded` 和 `skipped_existing`。
 - 每条可用结果都必须能找到本地 `resume.md` 和 `resume.json`。
-- 任一请求来源不足 3 份时，本轮采集失败；但仍会报告失败来源、失败分类、候选人级错误，以及已经落地的可用简历总数。
+- 任一请求来源正式采集不足 3 份时，本轮采集失败；但仍会报告失败来源、失败分类、候选人级错误、probe 可用数，以及已经落地的可用简历总数。
 
 ## 输出
 
@@ -134,7 +136,7 @@ boss resumes --from search --keyword <keyword> --job <job> --limit 3 --json
 
 后续匹配逻辑只读取 `jd.md`、`collection_manifest.json`，以及 manifest 中列出的本地 `resume.md` / `resume.json` 文件。匹配阶段不要再实时访问 BOSS。
 
-失败 run 也可能包含已成功落地的简历；后续匹配只能消费 manifest 中状态为 `downloaded` 或 `skipped_existing` 且本地文件存在的条目。
+失败 run 也可能包含已成功落地的简历，包括正式采集和 probe 阶段落地的结果；后续匹配只能消费 manifest 中状态为 `downloaded` 或 `skipped_existing` 且本地文件存在的条目。
 
 ## 打包
 

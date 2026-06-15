@@ -11,6 +11,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,11 @@ from typing import Any
 
 DEFAULT_SOURCES = ("chat", "recommend", "search")
 USABLE_STATUSES = {"downloaded", "skipped_existing"}
+SOURCE_RETRY_DELAYS = {
+    "chat": [],
+    "recommend": [5, 15],
+    "search": [5, 15],
+}
 FAILURE_KINDS = {
     "boss_not_found",
     "login_or_session",
@@ -324,6 +330,57 @@ def count_usable_results(source_result: dict[str, Any]) -> int:
     return usable_count
 
 
+def source_retry_delays(source: str) -> list[int]:
+    return SOURCE_RETRY_DELAYS.get(source, [])
+
+
+def source_attempts(source: str) -> int:
+    return len(source_retry_delays(source)) + 1
+
+
+def compact_attempt_result(result: dict[str, Any], attempt: int, max_attempts: int) -> dict[str, Any]:
+    copied = dict(result)
+    copied.pop("attempts", None)
+    copied["attempt"] = attempt
+    copied["max_attempts"] = max_attempts
+    copied["usable_count"] = count_usable_results(copied)
+    return copied
+
+
+def run_with_retries(
+    *,
+    source: str,
+    operation: str,
+    runner: Any,
+    is_success: Any,
+    retry_delays: list[int] | None = None,
+) -> dict[str, Any]:
+    delays = retry_delays if retry_delays is not None else source_retry_delays(source)
+    max_attempts = len(delays) + 1
+    attempts: list[dict[str, Any]] = []
+    last_result: dict[str, Any] | None = None
+    for index in range(max_attempts):
+        attempt = index + 1
+        result = runner()
+        result["operation"] = operation
+        result["attempt"] = attempt
+        result["max_attempts"] = max_attempts
+        result["usable_count"] = count_usable_results(result)
+        attempts.append(compact_attempt_result(result, attempt, max_attempts))
+        last_result = result
+        if is_success(result):
+            break
+        if index < len(delays):
+            time.sleep(delays[index])
+    if last_result is None:
+        raise RuntimeError(f"{operation} did not run")
+    final = dict(last_result)
+    final["attempts"] = attempts
+    final["attempt_count"] = len(attempts)
+    final["max_attempts"] = max_attempts
+    return final
+
+
 def run_boss_resumes_command(cmd: list[str], source: str, timeout_seconds: int) -> dict[str, Any]:
     completed = run_command(cmd, timeout_seconds=timeout_seconds)
     if not completed["ok"]:
@@ -386,7 +443,12 @@ def run_resume_probe(
         search_job=search_job,
         search_city=search_city,
     )
-    result = run_boss_resumes_command(cmd, source, timeout_seconds)
+    result = run_with_retries(
+        source=source,
+        operation="probe",
+        runner=lambda: run_boss_resumes_command(cmd, source, timeout_seconds),
+        is_success=lambda item: item.get("ok") and count_usable_results(item) >= 1,
+    )
     usable_count = count_usable_results(result)
     result["usable_count"] = usable_count
     if not result.get("ok"):
@@ -428,6 +490,19 @@ def run_preflight(
         result["name"] = name
         results.append(result)
 
+    hard_failed = [item for item in results if item["name"] == "boss_help" and not item["ok"]]
+    if hard_failed:
+        return {
+            "ok": False,
+            "hard_ok": False,
+            "probes_ok": False,
+            "checks": results,
+            "failure_kind": hard_failed[0]["failure_kind"],
+            "message": hard_failed[0]["message"],
+            "probe_failure_kind": None,
+            "probe_message": "",
+        }
+
     for source in DEFAULT_SOURCES:
         result = run_resume_probe(
             boss_bin,
@@ -442,13 +517,28 @@ def run_preflight(
         result["name"] = f"{source}_resume_probe"
         results.append(result)
 
-    failed = [item for item in results if not item["ok"]]
+    probe_failed = [item for item in results if item["name"] != "boss_help" and not item["ok"]]
     return {
-        "ok": not failed,
+        "ok": not hard_failed,
+        "hard_ok": not hard_failed,
+        "probes_ok": not probe_failed,
         "checks": results,
-        "failure_kind": failed[0]["failure_kind"] if failed else None,
-        "message": failed[0]["message"] if failed else "",
+        "failure_kind": hard_failed[0]["failure_kind"] if hard_failed else None,
+        "message": hard_failed[0]["message"] if hard_failed else "",
+        "probe_failure_kind": probe_failed[0]["failure_kind"] if probe_failed else None,
+        "probe_message": probe_failed[0]["message"] if probe_failed else "",
     }
+
+
+def source_probe_results(preflight: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for check in preflight.get("checks", []):
+        name = str(check.get("name") or "")
+        suffix = "_resume_probe"
+        if name.endswith(suffix):
+            source = name[: -len(suffix)]
+            out[source] = check
+    return out
 
 
 def run_boss_resumes(
@@ -487,45 +577,12 @@ def run_boss_resumes(
                 "errors": ["搜索关键词不明确。请传入 --search-keyword 或 --job-keyword。"],
             }
 
-    completed = run_command(cmd, timeout_seconds=timeout_seconds)
-    if not completed["ok"]:
-        combined = f"{completed.get('stdout', '')}\n{completed.get('stderr', '')}"
-        return {
-            "ok": False,
-            "source": source,
-            "command": cmd,
-            "exit_code": completed.get("exit_code"),
-            "stdout": completed.get("stdout", ""),
-            "stderr": completed.get("stderr", ""),
-            "results": [],
-            "counts": {},
-            "usable_count": 0,
-            "failure_kind": completed.get("failure_kind") or classify_failure(combined) or "unknown",
-            "errors": [completed.get("stderr", "").strip() or completed.get("stdout", "").strip() or "boss resumes failed"],
-        }
-
-    try:
-        parsed = json.loads(completed["stdout"])
-    except json.JSONDecodeError as exc:
-        return {
-            "ok": False,
-            "source": source,
-            "command": cmd,
-            "exit_code": completed.get("exit_code"),
-            "stdout": completed.get("stdout", ""),
-            "stderr": completed.get("stderr", ""),
-            "results": [],
-            "counts": {},
-            "usable_count": 0,
-            "failure_kind": "json_parse_failed",
-            "errors": [f"boss resumes did not return valid JSON: {exc}"],
-        }
-
-    parsed["command"] = cmd
-    parsed["exit_code"] = completed.get("exit_code")
-    parsed["stderr"] = completed.get("stderr", "")
-    parsed["failure_kind"] = None
-    return parsed
+    return run_with_retries(
+        source=source,
+        operation="collection",
+        runner=lambda: run_boss_resumes_command(cmd, source, timeout_seconds),
+        is_success=lambda item: item.get("ok") and count_usable_results(item) >= 3,
+    )
 
 
 def path_exists(value: str | None) -> bool:
@@ -561,10 +618,54 @@ def validate_source_result(source_result: dict[str, Any]) -> tuple[int, list[str
     return usable_count, errors, failure_kind
 
 
+def result_item_key(item: dict[str, Any]) -> str:
+    artifacts = item.get("artifacts") or {}
+    return (
+        item.get("candidateId")
+        or item.get("geekId")
+        or artifacts.get("resumeJsonPath")
+        or artifacts.get("resumeMarkdownPath")
+        or f"{item.get('candidateName')}:{item.get('jobId')}:{item.get('status')}"
+    )
+
+
+def merge_result_items(*results: dict[str, Any] | None) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    merged: list[dict[str, Any]] = []
+    for result in results:
+        if not result:
+            continue
+        for item in result.get("results", []):
+            key = result_item_key(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+    return merged
+
+
+def count_usable_items(items: list[dict[str, Any]]) -> int:
+    return count_usable_results({"results": items})
+
+
+def attach_probe_result(source_result: dict[str, Any], probe_result: dict[str, Any] | None) -> dict[str, Any]:
+    result = dict(source_result)
+    if probe_result:
+        result["probe_result"] = probe_result
+        result["probe_usable_count"] = count_usable_results(probe_result)
+    else:
+        result["probe_result"] = None
+        result["probe_usable_count"] = 0
+    effective_results = merge_result_items(result, probe_result)
+    result["effective_results"] = effective_results
+    result["effective_usable_count"] = count_usable_items(effective_results)
+    return result
+
+
 def flatten_items(source_results: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for source, result in source_results.items():
-        for item in result.get("results", []):
+        for item in result.get("effective_results") or result.get("results", []):
             artifacts = item.get("artifacts") or {}
             items.append(
                 {
@@ -614,6 +715,7 @@ def troubleshooting_hint(failure_kind: str | None) -> str:
 def empty_source_result(source: str, failure_kind: str, message: str) -> dict[str, Any]:
     return {
         "ok": False,
+        "status": "collection_not_started",
         "source": source,
         "command": [],
         "exit_code": None,
@@ -622,6 +724,9 @@ def empty_source_result(source: str, failure_kind: str, message: str) -> dict[st
         "results": [],
         "counts": {},
         "usable_count": 0,
+        "probe_usable_count": 0,
+        "effective_usable_count": 0,
+        "effective_results": [],
         "failure_kind": failure_kind,
         "errors": [message],
     }
@@ -645,11 +750,18 @@ def write_summary(path: Path, manifest: dict[str, Any]) -> None:
     ]
     preflight = manifest["preflight"]
     lines.append(f"- 自检通过: {preflight['ok']}")
+    lines.append(f"- 硬性自检通过: {preflight.get('hard_ok', preflight['ok'])}")
+    lines.append(f"- 来源 probe 全部通过: {preflight.get('probes_ok', preflight['ok'])}")
+    if preflight.get("probe_failure_kind"):
+        lines.append(f"- probe 失败分类: {preflight.get('probe_failure_kind')}")
     if not preflight["ok"]:
         lines.append(f"- 失败分类: {preflight.get('failure_kind') or 'unknown'}")
         lines.append(f"- 下一步建议: {troubleshooting_hint(preflight.get('failure_kind'))}")
     for check in preflight.get("checks", []):
-        lines.append(f"- {check['name']}: 通过={check['ok']}, 失败分类={check.get('failure_kind') or '无'}")
+        detail = f"- {check['name']}: 通过={check['ok']}, 失败分类={check.get('failure_kind') or '无'}"
+        if check.get("operation") == "probe":
+            detail += f", 可用={check.get('usable_count', 0)}, attempts={check.get('attempt_count', 1)}/{check.get('max_attempts', 1)}"
+        lines.append(detail)
         if check.get("message"):
             lines.append(f"  - {check['message']}")
 
@@ -657,8 +769,12 @@ def write_summary(path: Path, manifest: dict[str, Any]) -> None:
     for source in manifest["requested_sources"]:
         result = manifest["sources"][source]
         lines.append(
-            f"- {source}: 可用={result['usable_count']}/3, "
+            f"- {source}: 正式采集可用={result['usable_count']}/3, "
+            f"状态={result.get('status') or 'unknown'}, "
+            f"probe 可用={result.get('probe_usable_count', 0)}, "
+            f"实际已落地可用={result.get('effective_usable_count', result['usable_count'])}, "
             f"失败分类={result.get('failure_kind') or '无'}, "
+            f"attempts={result.get('attempt_count', 1)}/{result.get('max_attempts', 1)}, "
             f"downloaded={result.get('counts', {}).get('downloaded', 0)}, "
             f"skipped_existing={result.get('counts', {}).get('skipped_existing', 0)}, "
             f"missing_identifiers={result.get('counts', {}).get('missing_identifiers', 0)}, "
@@ -684,14 +800,19 @@ def build_manifest(
     requested_sources: tuple[str, ...],
 ) -> dict[str, Any]:
     items = flatten_items(sources)
-    source_usable_counts = {source: sources[source]["usable_count"] for source in requested_sources}
+    source_usable_counts = {
+        source: sources[source].get("effective_usable_count", sources[source]["usable_count"])
+        for source in requested_sources
+    }
+    source_collection_counts = {source: sources[source]["usable_count"] for source in requested_sources}
+    source_probe_counts = {source: sources[source].get("probe_usable_count", 0) for source in requested_sources}
     failed_sources = [
         source
         for source in requested_sources
         if sources[source]["usable_count"] != 3 or bool(sources[source].get("errors"))
     ]
     return {
-        "ok": preflight["ok"] and all(source_usable_counts[source] == 3 and not sources[source]["errors"] for source in requested_sources),
+        "ok": preflight["ok"] and all(source_collection_counts[source] == 3 and not sources[source]["errors"] for source in requested_sources),
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "requested_sources": list(requested_sources),
         "run_dir": str(run_dir),
@@ -708,6 +829,8 @@ def build_manifest(
         "unique_items": unique_items(items),
         "usable_total": sum(source_usable_counts.values()),
         "source_usable_counts": source_usable_counts,
+        "source_collection_counts": source_collection_counts,
+        "source_probe_counts": source_probe_counts,
         "failed_sources": failed_sources,
     }
 
@@ -773,6 +896,7 @@ def main() -> int:
             search_city,
             args.command_timeout_seconds,
         )
+        probes = source_probe_results(preflight)
         sources = {}
         if preflight["ok"]:
             for source in requested_sources:
@@ -790,7 +914,8 @@ def main() -> int:
                 result["usable_count"] = usable_count
                 result["errors"] = errors
                 result["failure_kind"] = failure_kind
-                sources[source] = result
+                result["status"] = "collection_failed" if failure_kind or errors else "collection_finished"
+                sources[source] = attach_probe_result(result, probes.get(source))
         else:
             message = preflight.get("message") or "采集前自检失败"
             failure_kind = preflight.get("failure_kind") or "unknown"
