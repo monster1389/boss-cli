@@ -138,6 +138,10 @@ export function matchSearchJobCandidate(keyword: string, rawCandidate: string): 
   return null;
 }
 
+export function resolveSelectedSearchJob(keyword: string, currentJobText: string): SearchJobMatchCandidate | null {
+  return matchSearchJobCandidate(keyword, currentJobText);
+}
+
 const SEARCH_CITY_POLLUTION_WORDS = [
   '热门',
   '北京',
@@ -167,6 +171,15 @@ export function isSearchJobCandidatePollutedByCity(candidates: string[]): boolea
     return false;
   }
   const hits = normalized.filter((item) => SEARCH_CITY_POLLUTION_WORDS.includes(item)).length;
+  return hits >= 5;
+}
+
+export function hasSearchCityOverlayResidue(currentCityText: string, jobCandidates: string[]): boolean {
+  const normalizedCityText = normalizeSearchCityText(currentCityText);
+  if (jobCandidates.length > 0) {
+    return isSearchJobCandidatePollutedByCity(jobCandidates);
+  }
+  const hits = SEARCH_CITY_POLLUTION_WORDS.filter((word) => normalizedCityText.includes(word)).length;
   return hits >= 5;
 }
 
@@ -441,9 +454,47 @@ async function ensureSearchControlsReady(frame: Frame): Promise<void> {
 async function readSearchSelectedJobDropdownLabel(frame: Frame): Promise<string> {
   return (await frame.evaluate(`(() => {
     const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
-    const label = norm(document.querySelector(".search-job-list-C .ui-dropmenu-label")?.textContent);
+    const el = document.querySelector(".search-job-list-C .ui-dropmenu-label");
+    const label = norm(el?.innerText || el?.textContent);
     return label || "unknown-job";
   })()`)) as string;
+}
+
+async function clearSearchFloatingOverlays(frame: Frame): Promise<void> {
+  for (let i = 0; i < 3; i++) {
+    await frame.evaluate(`(() => {
+      const active = document.activeElement;
+      if (active instanceof HTMLElement) active.blur();
+      for (const target of [active, document.body, document]) {
+        if (!target) continue;
+        target.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true }));
+        target.dispatchEvent(new KeyboardEvent("keyup", { key: "Escape", code: "Escape", bubbles: true }));
+      }
+      const safeTargets = [
+        ".search-container",
+        ".search-input-wrap",
+        ".search-part-container",
+      ];
+      const safe = safeTargets
+        .map((selector) => document.querySelector(selector))
+        .find((el) => el instanceof HTMLElement && !el.closest(".city-wrap") && !el.closest(".search-job-list-C"));
+      if (safe instanceof HTMLElement) safe.click();
+      return true;
+    })()`);
+    await sleepRandom(80, 140);
+  }
+}
+
+async function readMatchingSelectedSearchJob(frame: Frame, keyword: string): Promise<SearchJobMatchCandidate | null> {
+  for (let i = 0; i < 3; i++) {
+    const currentJob = await readSearchSelectedJobDropdownLabel(frame);
+    const match = resolveSelectedSearchJob(keyword, currentJob);
+    if (match) {
+      return match;
+    }
+    await sleepRandom(120, 220);
+  }
+  return null;
 }
 
 async function readSearchSelectedCity(frame: Frame): Promise<string> {
@@ -474,21 +525,13 @@ async function selectSearchJob(frame: Frame, keyword: string): Promise<SearchJob
   if (!kw) {
     throw new Error('resumes --from search 的 --job 不能为空。');
   }
-  await frame.evaluate(`(() => {
-    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true }));
-    document.dispatchEvent(new KeyboardEvent("keyup", { key: "Escape", code: "Escape", bubbles: true }));
-    const searchContainer = document.querySelector(".search-container");
-    if (searchContainer instanceof HTMLElement) searchContainer.click();
-    return true;
-  })()`);
-  await sleepRandom(120, 220);
-  const currentJob = await readSearchSelectedJobDropdownLabel(frame);
-  const currentJobMatch = matchSearchJobCandidate(kw, currentJob);
+  await clearSearchFloatingOverlays(frame);
+  const currentJobMatch = await readMatchingSelectedSearchJob(frame, kw);
   if (currentJobMatch) {
     return {
-      selectedJob: currentJob,
+      selectedJob: currentJobMatch.raw,
       matchMethod: currentJobMatch.matchMethod,
-      candidateSample: [currentJob],
+      candidateSample: [currentJobMatch.raw],
     };
   }
   const clicked = (await frame.evaluate(`(() => {
@@ -582,13 +625,24 @@ async function selectSearchJob(frame: Frame, keyword: string): Promise<SearchJob
     currentCityText: string;
   };
   if (!result.selected) {
+    const currentJobMatchAfterDropdown = resolveSelectedSearchJob(kw, result.currentJobText);
+    if (currentJobMatchAfterDropdown) {
+      return {
+        selectedJob: currentJobMatchAfterDropdown.raw,
+        matchMethod: currentJobMatchAfterDropdown.matchMethod,
+        candidateSample: [currentJobMatchAfterDropdown.raw],
+      };
+    }
     const candidates = result.sample.length > 0
       ? result.sample.map((item) => `${item.raw} [${item.normalized}]`).join(' / ')
       : '无可见岗位候选';
+    const cityResidueHint = hasSearchCityOverlayResidue(result.currentCityText, result.sample.map((item) => item.raw))
+      ? '；检测到城市弹层残留导致岗位候选不可见'
+      : '';
     const pollutionHint = isSearchJobCandidatePollutedByCity(result.sample.map((item) => item.raw))
       ? '；检测到候选项像城市/省份列表，疑似岗位弹层被城市弹层污染'
       : '';
-    throw new Error(`搜索页岗位下拉中未找到匹配岗位：${kw}；规范化关键词：${result.normalizedKeyword}；当前岗位文本：${result.currentJobText || '空'}；当前城市文本：${result.currentCityText || '空'}；可见候选：${candidates}${pollutionHint}`);
+    throw new Error(`搜索页岗位下拉中未找到匹配岗位：${kw}；规范化关键词：${result.normalizedKeyword}；当前岗位文本：${result.currentJobText || '空'}；当前城市文本：${result.currentCityText || '空'}；可见候选：${candidates}${cityResidueHint}${pollutionHint}`);
   }
   await sleepRandom(400, 700);
   return {
@@ -606,105 +660,109 @@ async function selectSearchCity(frame: Frame, city: string): Promise<string> {
   if (await isSearchCitySelected(frame, targetCity)) {
     return targetCity;
   }
-  const cityHandle = await frame.$('.city-wrap');
-  if (!cityHandle) {
-    throw new Error(`搜索页未找到城市选择控件，无法选择城市：${targetCity}`);
-  }
-  await cityHandle.click();
-  await cityHandle.dispose();
-  await sleepRandom(300, 520);
-  const province = SEARCH_CITY_PROVINCE[targetCity];
-  if (province) {
-    const provinceClicked = (await frame.evaluate(`(() => {
-      const province = ${JSON.stringify(province)};
+  let lastResult: { selected: string; visibleTexts: string[]; currentCityText: string } | null = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    await clearSearchFloatingOverlays(frame);
+    const cityHandle = await frame.$('.city-wrap');
+    if (!cityHandle) {
+      throw new Error(`搜索页未找到城市选择控件，无法选择城市：${targetCity}`);
+    }
+    await cityHandle.click();
+    await cityHandle.dispose();
+    await sleepRandom(300, 520);
+    const province = SEARCH_CITY_PROVINCE[targetCity];
+    if (province) {
+      const provinceClicked = (await frame.evaluate(`(() => {
+        const province = ${JSON.stringify(province)};
+        const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
+        const isVisible = (el) => {
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+        };
+        const items = Array.from(document.querySelectorAll(".city-select-panel *, .city-list *, .city-panel *, .city-picker *, .ui-dropmenu-list *, [class*='city'] *"))
+          .filter((el) => el instanceof HTMLElement && isVisible(el))
+          .filter((el) => norm(el.textContent) === province);
+        const target = items[0];
+        if (!(target instanceof HTMLElement)) return false;
+        target.scrollIntoView({ block: "center", inline: "nearest" });
+        target.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, view: window }));
+        target.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true, view: window }));
+        target.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, view: window }));
+        target.click();
+        return true;
+      })()`)) as boolean;
+      if (provinceClicked) {
+        await sleepRandom(300, 520);
+      }
+    }
+
+    const result = (await frame.evaluate(`(() => {
+      const city = ${JSON.stringify(targetCity)};
       const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
+      const currentCityText = norm(document.querySelector(".city-wrap")?.innerText || document.querySelector(".city-wrap")?.textContent);
       const isVisible = (el) => {
         const rect = el.getBoundingClientRect();
         const style = window.getComputedStyle(el);
         return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
       };
-      const items = Array.from(document.querySelectorAll(".city-select-panel *, .city-list *, .city-panel *, .city-picker *, .ui-dropmenu-list *, [class*='city'] *"))
+      const selectors = [
+        ".city-select-panel li",
+        ".city-select-panel a",
+        ".city-select-panel span",
+        ".city-select-panel dd",
+        ".city-select-panel p",
+        ".city-list li",
+        ".city-list a",
+        ".city-list span",
+        ".city-list dd",
+        ".city-list p",
+        ".city-panel li",
+        ".city-panel a",
+        ".city-panel span",
+        ".city-panel dd",
+        ".city-panel p",
+        ".city-picker li",
+        ".city-picker a",
+        ".city-picker span",
+        ".city-picker dd",
+        ".city-picker p",
+        ".ui-dropmenu-list li",
+        ".ui-dropmenu-list a",
+        ".ui-dropmenu-list span",
+        "[class*='city'] li",
+        "[class*='city'] a",
+        "[class*='city'] span",
+        "[class*='city'] dd",
+        "[class*='city'] p"
+      ];
+      const items = Array.from(document.querySelectorAll(selectors.join(",")))
         .filter((el) => el instanceof HTMLElement && isVisible(el))
-        .filter((el) => norm(el.textContent) === province);
-      const target = items[0];
-      if (!(target instanceof HTMLElement)) return false;
-      target.scrollIntoView({ block: "center", inline: "nearest" });
-      target.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, view: window }));
-      target.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true, view: window }));
-      target.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, view: window }));
-      target.click();
-      return true;
-    })()`)) as boolean;
-    if (provinceClicked) {
-      await sleepRandom(300, 520);
-    }
-  }
-
-  const result = (await frame.evaluate(`(() => {
-    const city = ${JSON.stringify(targetCity)};
-    const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
-    const currentCityText = norm(document.querySelector(".city-wrap")?.innerText || document.querySelector(".city-wrap")?.textContent);
-    const isVisible = (el) => {
-      const rect = el.getBoundingClientRect();
-      const style = window.getComputedStyle(el);
-      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
-    };
-    const selectors = [
-      ".city-select-panel li",
-      ".city-select-panel a",
-      ".city-select-panel span",
-      ".city-select-panel dd",
-      ".city-select-panel p",
-      ".city-list li",
-      ".city-list a",
-      ".city-list span",
-      ".city-list dd",
-      ".city-list p",
-      ".city-panel li",
-      ".city-panel a",
-      ".city-panel span",
-      ".city-panel dd",
-      ".city-panel p",
-      ".city-picker li",
-      ".city-picker a",
-      ".city-picker span",
-      ".city-picker dd",
-      ".city-picker p",
-      ".ui-dropmenu-list li",
-      ".ui-dropmenu-list a",
-      ".ui-dropmenu-list span",
-      "[class*='city'] li",
-      "[class*='city'] a",
-      "[class*='city'] span",
-      "[class*='city'] dd",
-      "[class*='city'] p"
-    ];
-    const items = Array.from(document.querySelectorAll(selectors.join(",")))
-      .filter((el) => el instanceof HTMLElement && isVisible(el))
-      .filter((el) => {
+        .filter((el) => {
+          const text = norm(el.innerText || el.textContent);
+          return text && text.length <= 20;
+        });
+      const target = items.find((el) => norm(el.innerText || el.textContent) === city) || items.find((el) => {
         const text = norm(el.innerText || el.textContent);
-        return text && text.length <= 20;
+        return text.includes(city);
       });
-    const target = items.find((el) => norm(el.innerText || el.textContent) === city) || items.find((el) => {
-      const text = norm(el.innerText || el.textContent);
-      return text.includes(city);
-    });
-    const visibleTexts = Array.from(new Set(items.map((el) => norm(el.innerText || el.textContent)).filter(Boolean))).slice(0, 40);
-    if (!(target instanceof HTMLElement)) return { selected: "", visibleTexts, currentCityText };
-    const text = norm(target.innerText || target.textContent);
-    target.scrollIntoView({ block: "center", inline: "nearest" });
-    target.click();
-    return { selected: text, visibleTexts, currentCityText };
-  })()`)) as { selected: string; visibleTexts: string[]; currentCityText: string };
-  if (!result.selected) {
-    if (await isSearchCitySelected(frame, targetCity)) {
-      return targetCity;
+      const visibleTexts = Array.from(new Set(items.map((el) => norm(el.innerText || el.textContent)).filter(Boolean))).slice(0, 40);
+      if (!(target instanceof HTMLElement)) return { selected: "", visibleTexts, currentCityText };
+      const text = norm(target.innerText || target.textContent);
+      target.scrollIntoView({ block: "center", inline: "nearest" });
+      target.click();
+      return { selected: text, visibleTexts, currentCityText };
+    })()`)) as { selected: string; visibleTexts: string[]; currentCityText: string };
+    lastResult = result;
+    if (result.selected || await isSearchCitySelected(frame, targetCity)) {
+      await sleepRandom(400, 700);
+      return readSearchSelectedCity(frame);
     }
-    const candidates = result.visibleTexts.length > 0 ? result.visibleTexts.join(' / ') : '城市弹层无可见候选';
-    throw new Error(`搜索页城市选择中未找到匹配城市：${targetCity}；当前城市文本：${result.currentCityText || '空'}；可见候选：${candidates}`);
+    await clearSearchFloatingOverlays(frame);
+    await sleepRandom(220, 380);
   }
-  await sleepRandom(400, 700);
-  return readSearchSelectedCity(frame);
+  const candidates = lastResult && lastResult.visibleTexts.length > 0 ? lastResult.visibleTexts.join(' / ') : '城市弹层无可见候选';
+  throw new Error(`搜索页城市选择中未找到匹配城市：${targetCity}；当前城市文本：${lastResult?.currentCityText || '空'}；可见候选：${candidates}`);
 }
 
 async function submitSearchKeyword(frame: Frame, keyword: string): Promise<void> {
